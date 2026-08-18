@@ -947,7 +947,13 @@ MODEL_SWITCHER_SELECTORS = [
 # 실측(2026-07-10): pill 클릭 → menuitemradio(즉시/중간/높음/매우 높음/Pro=추론단계)
 #   + menuitem("GPT-5.6 Sol"=모델 서브메뉴 트리거). 트리거를 hover하면 모델 radio들
 #   (GPT-5.6 Sol/GPT-5.5/GPT-5.4/GPT-5.3/o3)이 같은 메뉴 DOM에 menuitemradio로 추가된다.
+# 실측(2026-08-18): UI 개편 — pill 팝오버가 슬라이더(simple 뷰)로 열린다.
+#   [data-testid="composer-intelligence-picker-content"] 안에 '고급' menuitem이 있고,
+#   클릭하면 advanced 뷰('모델' / '추론 강도' 서브메뉴 트리거)로 전환된다.
+#   '추론 강도'를 hover하면 옛 menuitemradio 목록(즉시/중간/높음/매우 높음/Pro)이 그대로 뜬다.
+#   활성 모델명은 '모델' 행의 trailing span(예: 'GPT-5.6 Sol')에 표시된다.
 EFFORT_ITEM_SELECTORS = ['[role="menuitemradio"]', '[role="menuitem"]', '[role="option"]']
+INTELLIGENCE_PICKER_SELECTOR = '[data-testid="composer-intelligence-picker-content"]'
 
 
 def read_model_pills(page) -> list[str]:
@@ -962,7 +968,56 @@ def read_model_pills(page) -> list[str]:
     return out
 
 
-def _open_switcher(page):
+def _enter_effort_view(page) -> None:
+    """새 슬라이더 UI(2026-08): 팝오버가 simple 슬라이더 뷰로 열리므로
+    '고급' 클릭 → '추론 강도' hover로 옛 menuitemradio 목록을 노출시킨다.
+    구 UI(팝오버 testid 없음)면 아무것도 하지 않는다."""
+    try:
+        if not page.query_selector(INTELLIGENCE_PICKER_SELECTOR):
+            return  # 구 UI
+        # 1) '고급' 항목 클릭 (simple 뷰일 때만 존재 — advanced 뷰면 스킵)
+        for it in page.query_selector_all('[role="menuitem"]'):
+            t = (it.inner_text() or "").strip()
+            if t.startswith("고급") or t.lower().startswith("advanced"):
+                it.click()
+                time.sleep(0.8)
+                break
+        # 2) '추론 강도' 서브메뉴 트리거 hover → 추론단계 radio 노출 대기
+        for it in page.query_selector_all('[role="menuitem"][data-has-submenu]'):
+            t = (it.inner_text() or "").strip()
+            if t.startswith("추론") or "reasoning" in t.lower() or "effort" in t.lower():
+                it.hover()
+                for _ in range(10):
+                    time.sleep(0.3)
+                    if page.query_selector('[role="menuitemradio"]'):
+                        break
+                break
+    except Exception:
+        pass
+
+
+def _close_switcher(page) -> None:
+    """스위처 팝오버 닫기. 새 UI에선 서브메뉴가 열려 있으면 Escape 1회는 서브메뉴만
+    닫으므로, 팝오버가 사라질 때까지 최대 3회 누른다.
+    주의: 메뉴가 이미 닫혀 있으면 Escape를 누르지 않는다 — 응답 생성 중에 페이지에
+    Escape가 가면 '응답 생성을 중지할까요?' 다이얼로그가 떠버린다(2026-08-18 실측)."""
+    try:
+        for _ in range(3):
+            if not page.query_selector(f'{INTELLIGENCE_PICKER_SELECTOR}, [role="menu"][data-state="open"]'):
+                break
+            page.keyboard.press("Escape")
+            time.sleep(0.3)
+    except Exception:
+        pass
+
+
+def _open_switcher_raw(page) -> bool:
+    """pill 클릭으로 팝오버만 연다(뷰 전환 없음). 이미 열려 있으면 그대로 True."""
+    try:
+        if page.query_selector(INTELLIGENCE_PICKER_SELECTOR):
+            return True
+    except Exception:
+        pass
     for sel in MODEL_SWITCHER_SELECTORS:
         try:
             el = page.query_selector(sel)
@@ -975,9 +1030,77 @@ def _open_switcher(page):
     return False
 
 
+def _open_switcher(page):
+    if _open_switcher_raw(page):
+        _enter_effort_view(page)
+        return True
+    return False
+
+
+def _slider_value(page) -> tuple[int | None, int | None]:
+    """새 UI 슬라이더의 (현재값, 최대값). 슬라이더 없으면 (None, None)."""
+    try:
+        r = page.evaluate("""() => {
+          const s = document.querySelector('[role="slider"]');
+          return s ? [ +s.getAttribute('aria-valuenow'), +s.getAttribute('aria-valuemax') ] : null;
+        }""")
+        return (r[0], r[1]) if r else (None, None)
+    except Exception:
+        return (None, None)
+
+
+def _set_effort_slider(page, target_idx: int) -> bool:
+    """새 UI(2026-08): 추론단계 슬라이더를 target_idx로 이동.
+    서브메뉴 radio는 슬라이더 파티클 애니메이션의 상시 리렌더로 클릭이 detach 실패하므로
+    (일반/force/좌표 클릭 전부 무효 실측), 유일하게 안정적인 경로는
+    SliderControl 프로그램 focus + ArrowLeft/ArrowRight 키 입력이다."""
+    try:
+        for _attempt in range(2):
+            cur, mx = _slider_value(page)
+            if cur is None:
+                return False
+            if cur == target_idx:
+                return True
+            ok = page.evaluate("""() => {
+              const c = document.querySelector('[data-model-reasoning-effort-slider]')?.closest('[role="menuitem"]');
+              if (!c) return false;
+              c.focus();
+              return document.activeElement === c;
+            }""")
+            if not ok:
+                return False
+            key = "ArrowRight" if target_idx > cur else "ArrowLeft"
+            for _ in range(abs(target_idx - cur)):
+                page.keyboard.press(key)
+                time.sleep(0.4)
+        cur, _mx = _slider_value(page)
+        return cur == target_idx
+    except Exception:
+        return False
+
+
+# 새 UI 슬라이더 인덱스 폴백 맵(서브메뉴 라벨을 못 읽었을 때만 사용).
+EFFORT_SLIDER_FALLBACK = {"즉시": 0, "중간": 1, "높음": 2, "매우 높음": 3, "pro": 4,
+                          "instant": 0, "standard": 1, "high": 2, "extended": 3}
+
+
 def read_menu_state(page) -> dict:
     """열린 메뉴에서 모델명(menuitem 중 checked/selected) + 체크된 추론단계(menuitemradio aria-checked)를 읽는다."""
     state = {"model": None, "model_source": None, "models": [], "effort_checked": None, "items": []}
+    try:
+        # 새 UI(2026-08): advanced 뷰의 '모델' 행 trailing span이 곧 활성 모델명(예: 'GPT-5.6 Sol').
+        for it in page.query_selector_all('[role="menuitem"][data-has-submenu]'):
+            t = (it.inner_text() or "").strip()
+            if t.startswith("모델") or t.lower().startswith("model"):
+                sp = it.query_selector(".trailing span")
+                name = ((sp.inner_text() or "").strip() if sp else "")[:40]
+                if name:
+                    state["model"] = name
+                    state["model_source"] = "checked"
+                    state["models"].append(name)
+                break
+    except Exception:
+        pass
     try:
         # 한 번 순회하며 (1) 모델같은 항목 전부 수집, (2) aria-checked/selected된 활성 모델 검출
         for it in page.query_selector_all('[role="menuitem"], [role="menuitemradio"], [role="option"]'):
@@ -1028,19 +1151,64 @@ def select_model(page, want: str, require_model: str | None = None) -> tuple[boo
     if require_model:
         if not before["model"]:
             print(f"  ❌ 모델명 획득 실패 (require_model '{require_model}' 검증 불가) → 즉시 중단 (fail-closed)")
-            try:
-                page.keyboard.press("Escape")
-            except Exception:
-                pass
+            _close_switcher(page)
             return False, None
         if require_model.lower() not in before["model"].lower():
             print(f"  ❌ 모델 불일치: 기대 '{require_model}' ≠ 메뉴 '{before['model']}' → 중단(전송 안 함)")
-            try:
-                page.keyboard.press("Escape")
-            except Exception:
-                pass
+            _close_switcher(page)
             return False, None
 
+    # ---- 새 UI(2026-08, 슬라이더) 경로 ----
+    if page.query_selector(INTELLIGENCE_PICKER_SELECTOR):
+        items = before["items"]  # 예: ['즉시','중간','높음','매우 높음','Pro'] (advanced 서브메뉴 실측)
+        idx = None
+        label = None
+        for exact in (True, False):
+            for i, t in enumerate(items):
+                low = t.strip().lower()
+                if (exact and low == want_l) or (not exact and want_l in low):
+                    idx, label = i, t.strip()
+                    break
+            if idx is not None:
+                break
+        if idx is None:
+            # 서브메뉴 라벨을 못 읽은 경우 폴백: pro=슬라이더 최댓값, 그 외 고정 맵
+            _cur, mx = _slider_value(page)
+            if want_l == "pro" and mx is not None:
+                idx, label = mx, "Pro"
+            elif want_l in EFFORT_SLIDER_FALLBACK:
+                idx, label = EFFORT_SLIDER_FALLBACK[want_l], want
+        if idx is None:
+            print(f"  ⚠️  '{want}' 추론단계 항목 못 찾음(슬라이더 UI) → 기본값")
+            _close_switcher(page)
+            return False, None
+
+        # 서브메뉴가 열린 advanced 뷰에선 슬라이더 키 입력이 불안정 → 닫고 simple 뷰로 재오픈
+        _close_switcher(page)
+        time.sleep(0.5)
+        if not _open_switcher_raw(page):
+            print("  ⚠️  슬라이더 재오픈 실패")
+            return False, None
+        slider_ok = _set_effort_slider(page, idx)
+        _close_switcher(page)
+        time.sleep(0.5)
+
+        pills = read_model_pills(page)
+        pill_txt = pills[0] if pills else ""
+        effort_verified = slider_ok and (pill_txt == label or want_l in pill_txt.lower())
+        # 모델 검증은 advanced 뷰에서 읽은 before(model_source='checked') 기준
+        model_verified = True
+        if require_model:
+            model_verified = (before["model"] is not None
+                              and require_model.lower() in before["model"].lower()
+                              and before.get("model_source") == "checked")
+        verified = model_verified and effort_verified
+        verified_model_name = f"{before['model'] or 'Unknown Model'} ({pill_txt or label})"
+        print(f"  {'✓' if verified else '⚠️'} 최종 모델 검증(슬라이더): model={before['model']} (기대:{require_model}), "
+              f"effort=슬라이더 {idx}({pill_txt or '?'}) (기대:{want}) -> 결과={'OK' if verified else '실패'}")
+        return verified, verified_model_name
+
+    # ---- 구 UI(radio 메뉴) 경로 ----
     # 추론단계 클릭 대상 탐색
     clicked = None
     cands = []
@@ -1053,10 +1221,17 @@ def select_model(page, want: str, require_model: str | None = None) -> tuple[boo
     for exact in (True, False):
         for it in cands:
             try:
+                # 서브메뉴 트리거(예: '추론 강도Pro' 행)는 클릭 대상이 아님 — 오클릭 방지.
+                if it.get_attribute("aria-haspopup"):
+                    continue
                 t = (it.inner_text() or "").strip()
                 low = t.lower()
                 if (exact and low == want_l) or (not exact and want_l in low):
-                    it.click()
+                    try:
+                        it.click(timeout=4000)
+                    except Exception:
+                        # 새 UI 서브메뉴는 애니메이션 탓에 액션ability 체크에 걸린다(2026-08-18 실측) → force 폴백
+                        it.click(force=True, timeout=4000)
                     clicked = t.splitlines()[0][:40]
                     time.sleep(1.5)  # 클릭 후 드롭다운이 닫히는 시간 대기
                     break
@@ -1067,10 +1242,7 @@ def select_model(page, want: str, require_model: str | None = None) -> tuple[boo
 
     if not clicked:
         print(f"  ⚠️  '{want}' 추론단계 항목 못 찾음 → 기본값")
-        try:
-            page.keyboard.press("Escape")
-        except Exception:
-            pass
+        _close_switcher(page)
         return False, None
 
     # Pro 제안: 메뉴 재오픈하여 effort_checked 및 model_checked 상태 검증
@@ -1079,10 +1251,7 @@ def select_model(page, want: str, require_model: str | None = None) -> tuple[boo
         return False, None
 
     after = read_menu_state(page)
-    try:
-        page.keyboard.press("Escape")
-    except Exception:
-        pass
+    _close_switcher(page)
     time.sleep(0.5)
 
     model_verified = True
