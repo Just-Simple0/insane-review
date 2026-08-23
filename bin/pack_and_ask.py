@@ -1686,12 +1686,34 @@ def _save_project_cache(cache_path: Path, cache: dict) -> None:
         pass
 
 
+# 워크스페이스 이동(개인→팀 등)으로 접근 불가가 된 프로젝트는 URL이 유지된 채
+# 에러 모달만 뜨는 케이스가 있어, URL 존재만으로는 생존 판정이 안 된다.
+_PROJECT_ACCESS_ERROR_RE = (
+    r"이 프로젝트에 액세스할 수 없습니다|can.t access this project|"
+    r"don.t have access|올바른 계정으로 로그인"
+)
+
+
 def project_home_ok(page, url: str) -> bool:
-    """캐시된 프로젝트 URL이 아직 살아있는지(삭제/404 아님) 확인 — 홈 이동 후 컴포저 존재."""
+    """캐시된 프로젝트 URL이 아직 살아있는지 확인.
+    조건: ① 최종 URL에 '그 프로젝트의 g-p id'가 그대로 있고 ② 접근불가 에러 텍스트가 없고 ③ 컴포저 존재.
+    (id 불일치=홈 리다이렉트, 에러 텍스트=타 워크스페이스 소속 → 모두 사망 판정)"""
     try:
+        m = re.search(r"(g-p-[0-9a-f]{32})", url)
+        gp_id = m.group(1) if m else None
         page.goto(url, wait_until="domcontentloaded", timeout=30000)
         time.sleep(2)
-        return "/g/g-p-" in page.url and find_input(page) is not None
+        if gp_id and gp_id not in page.url:
+            return False
+        if "/g/g-p-" not in page.url:
+            return False
+        has_error = page.evaluate(
+            "(re) => new RegExp(re, 'i').test(document.body ? document.body.innerText : '')",
+            _PROJECT_ACCESS_ERROR_RE,
+        )
+        if has_error:
+            return False
+        return find_input(page) is not None
     except Exception:
         return False
 
@@ -1779,6 +1801,10 @@ def ensure_project(page, name: str, cache_key: str, cache_path: Path) -> str | N
         cached = cache.get(cache_key)
         if cached and project_home_ok(page, cached):
             return cached
+        if cached:
+            # 사망 판정된 캐시는 즉시 폐기 — 다음 런부터 죽은 URL로 goto하며 에러 팝업을 띄우지 않는다
+            cache.pop(cache_key, None)
+            _save_project_cache(cache_path, cache)
         page.goto(CHATGPT_URL, wait_until="domcontentloaded", timeout=30000)  # 탐색/생성은 홈에서
         time.sleep(2)
         url = find_project_url(page, name)
