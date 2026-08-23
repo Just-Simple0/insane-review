@@ -1,5 +1,10 @@
 # Changelog
 
+
+## 0.6.4 — 2026-08-24
+
+- **Fix: first-run setup could wipe `settings.json`** — if the file was corrupted or contained comments (JSONC), the shared update-notifier installer re-wrote it as an empty object plus the hook, silently destroying all user settings. It now refuses to write when parsing fails and writes atomically (tmp + rename). Marketplace-wide propagation of the fix found in the ddiring v0.1.1 external review; reproduction-verified.
+
 ## 0.6.3 — 2026-08-23
 
 죽은 프로젝트 캐시(워크스페이스 이동) 생존 오판 수정.
