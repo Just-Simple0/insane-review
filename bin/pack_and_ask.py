@@ -16,6 +16,7 @@ force-answer 재시도, UUID/PID 파일명, repomix 버전 핀+timeout, 권한/�
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import hashlib
 import json
 import os
@@ -106,8 +107,10 @@ STREAMING_BTN_SELECTORS = [
     'button[aria-label="Stop streaming"]',
     'button[data-testid*="stop"]',
 ]
-USER_MSG_SELECTORS = ['[data-message-author-role="user"]', 'article[data-turn="user"]']
-ASSISTANT_MSG_SELECTORS = ['[data-message-author-role="assistant"]', 'article[data-turn="assistant"]']
+USER_MSG_SELECTORS = ['[data-message-author-role="user"]', 'section[data-turn="user"]', 'article[data-turn="user"]']
+ASSISTANT_MSG_SELECTORS = ['[data-message-author-role="assistant"]', 'section[data-turn="assistant"]', 'article[data-turn="assistant"]']
+# 턴 컨테이너(실측 2026-08-25: section[data-turn]) — copy 툴바는 메시지 div 바깥, 이 컨테이너 안에 있다
+TURN_CONTAINER_SELECTOR = 'section[data-turn], article[data-turn], [data-turn]'
 
 # 사용량 한도(쿼터) 차단 배너 감지 문구 — dialog/alert 표면에서만 대조(오탐 방지). 자유롭게 추가.
 QUOTA_HINTS = [
@@ -169,6 +172,8 @@ MIN_WAIT_SECS = 20
 STABLE_CHECK_SECS = 8
 STATUS_INTERVAL = 15
 FORCE_MAX_TRIES = 6    # force-answer 클릭 재시도 상한
+STALL_RELOAD_SECS = int(os.environ.get("INSANE_REVIEW_STALL_RELOAD", "45"))  # 빈 턴·스트리밍 없음 지속 시 재로드까지
+STALL_MAX_RELOADS = 3
 # '지금 답변 받기' 버튼(cot v5 UI, 실측 2026-07-19): 본문 리즈닝 고정행 안의 button.
 ANSWER_NOW_ROW_SELECTOR = 'div[data-testid="cot-v5-pinned-row"]'
 ANSWER_NOW_TEXT_RE = re.compile(r"답변\s*받기|Get answer|answer now", re.I)
@@ -762,38 +767,29 @@ def find_input(page):
     return None
 
 
+def _selector_union(selectors) -> str:
+    """폴백 리스트를 CSS selector-list 하나로 — querySelectorAll은 같은 노드를 중복 반환하지 않는다.
+    '첫 비영 셀렉터만 세는' 방식은 기준 시점과 현재 시점이 서로 다른 셀렉터를 세게 되어
+    count-delta가 깨진다(2026-08-24 실측: 와일드카드 copy 1개 → 정밀 copy 1개 = '증가 없음' 오판)."""
+    return selectors if isinstance(selectors, str) else ", ".join(selectors)
+
+
 def count_msgs(page, selectors) -> int:
-    if isinstance(selectors, str):
-        selectors = [selectors]
-    for sel in selectors:
-        try:
-            n = len(page.query_selector_all(sel))
-        except Exception:
-            continue
-        if n:
-            return n
-    return 0
+    try:
+        return len(page.query_selector_all(_selector_union(selectors)))
+    except Exception:
+        return 0
 
 
 def count_msgs_strict(page, selectors) -> int:
     """기준개수 포착 전용 — 조회 실패를 0으로 숨기지 않는다. 재시도 후에도 실패하면 예외(fail-closed).
     base_* 가 조회실패로 0이 되면 기존 DOM이 '새 턴'으로 오인돼 이전 답변을 저장할 수 있으므로 이를 차단한다."""
-    if isinstance(selectors, str):
-        selectors = [selectors]
     last_exc = None
     for _ in range(3):
-        got_zero_cleanly = True
-        for sel in selectors:
-            try:
-                n = len(page.query_selector_all(sel))
-            except Exception as exc:
-                last_exc = exc
-                got_zero_cleanly = False
-                continue
-            if n:
-                return n
-        if got_zero_cleanly:
-            return 0  # 전 셀렉터 조회 성공·전부 0 — 실제로 없음
+        try:
+            return len(page.query_selector_all(_selector_union(selectors)))
+        except Exception as exc:
+            last_exc = exc
         time.sleep(0.3)
     raise RuntimeError(f"기준 메시지 수 조회 실패({selectors}): {str(last_exc)[:60]} → 전송 중단(fail-closed)")
 
@@ -816,14 +812,33 @@ def msg_id_set(page) -> set:
         return set()
 
 
-def new_assistant_text(page, base_ids: set) -> str:
-    """base_ids에 없는 '신규' assistant 턴의 텍스트(여럿이면 마지막). 없으면 ''."""
+def new_assistant_node(page, base_ids: set | None, base_assistant: int = 0):
+    """회수 대상 assistant 노드. base_ids가 있으면 id 차집합의 마지막 신규 노드,
+    없으면(레거시) 전송 전보다 노드가 늘었을 때만 마지막 노드. 없으면 None."""
     try:
-        nodes = _qa(page, ASSISTANT_MSG_SELECTORS)
-        fresh = [n for n in nodes if (n.get_attribute("data-message-id") or "") not in base_ids]
-        return (fresh[-1].inner_text() or "") if fresh else ""
+        nodes = page.query_selector_all(_selector_union(ASSISTANT_MSG_SELECTORS))
+        if not nodes:
+            return None
+        if base_ids is None:
+            return nodes[-1] if len(nodes) > base_assistant else None
+        # id가 없는 컨테이너(section/article 폴백)는 차집합 판정 불가 → 제외(옛 턴을 '신규'로 오인 방지)
+        fresh = [n for n in nodes
+                 if (n.get_attribute("data-message-id") or "") and n.get_attribute("data-message-id") not in base_ids]
+        return fresh[-1] if fresh else None
+    except Exception:
+        return None
+
+
+def _node_text(node) -> str:
+    try:
+        return (node.inner_text() or "") if node is not None else ""
     except Exception:
         return ""
+
+
+def new_assistant_text(page, base_ids: set) -> str:
+    """base_ids에 없는 '신규' assistant 턴의 텍스트(여럿이면 마지막). 없으면 ''."""
+    return _node_text(new_assistant_node(page, base_ids))
 
 
 def current_url(page) -> str:
@@ -886,51 +901,76 @@ def last_assistant_text(page) -> str:
     return ""
 
 
-def last_turn_complete(page, base_assistant: int = 0, base_copy: int = 0) -> bool:
-    """마지막 assistant 턴이 '완료'됐다는 강한 신호: stop-button 사라짐 + 새 copy 버튼 등장.
-    base_assistant/base_copy: 전송 전 개수 — assistant 노드와 copy 버튼이 모두 늘었을 때만 새 턴 완료로 인정."""
-    if is_streaming(page):
-        return False
+def node_copy_button(node):
+    """해당 assistant 노드 '안'의 턴 복사 버튼(전역 마지막 버튼이 아님 — 코드블록 copy/다른 턴 오클릭 방지)."""
+    if node is None:
+        return None
+    scopes = [node]
     try:
-        # 전송 전보다 assistant 노드·copy 버튼이 늘지 않았으면 '이전 응답'이므로 완료로 보지 않음(fail-closed)
-        if count_msgs(page, ASSISTANT_MSG_SELECTORS) <= base_assistant:
-            return False
-        return len(_qa(page, COPY_BTN_SELECTORS)) > base_copy
+        container = node.evaluate_handle("(n, sel) => n.closest(sel)", TURN_CONTAINER_SELECTOR).as_element()
+        if container is not None:
+            scopes.insert(0, container)
     except Exception:
+        pass
+    for scope in scopes:
+        for sel in COPY_BTN_SELECTORS:
+            try:
+                btn = scope.query_selector(sel)
+                if btn is not None:
+                    return btn
+            except Exception:
+                continue
+    return None
+
+
+def send_button_ready(page) -> bool:
+    """컴포저가 다시 전송 가능 상태(=이전 턴 종결)인지. copy 툴바가 늦게 붙는 변형의 보조 종결 신호."""
+    for sel in SEND_BTN_SELECTORS:
+        try:
+            for btn in page.query_selector_all(sel):
+                if btn.is_visible() and btn.is_enabled():
+                    return True
+        except Exception:
+            continue
+    return False
+
+
+def turn_terminal(page, node) -> bool:
+    """대상 턴 종결 판정: 스트리밍 중 아님 + (그 노드의 copy 버튼 존재 또는 전송 버튼 복귀).
+    전역 copy 버튼 '개수 증가'를 필수 조건으로 삼던 설계는 툴바 지연/가상화/셀렉터 전환에 전부 취약해
+    완성된 답을 두고 최대 대기를 소진시켰다(2026-08-24 GPT Pro 리뷰 P0)."""
+    if node is None or is_streaming(page):
         return False
+    return node_copy_button(node) is not None or send_button_ready(page)
 
 
-def copy_last_turn(page, base_copy: int = 0, expected: str | None = None) -> str | None:
-    """새 턴의 copy 버튼을 눌러 클립보드로 회수(파이프 안전 검증 포함).
-    base_copy: 전송 전 copy 버튼 수 — 그보다 늘었을 때만(=새 응답 버튼) 회수해 이전 응답 오인을 막는다.
-    expected: 해당 턴의 DOM 텍스트 — 클립보드 경합(대기 중 사용자가 다른 것을 복사) 오염 가드.
-    sentinel은 '복사 실패'만 잡고 '남의 복사'는 못 잡으므로, DOM 텍스트 중간 조각이 클립보드
-    내용에 포함되는지 대조한다. 불일치면 버리고 호출자가 DOM 텍스트로 폴백(내용 오염 < 서식 손실)."""
+def clipboard_matches(txt: str, expected: str | None) -> bool:
+    """클립보드 경합 오염 가드. 짧은 응답(<80자)은 정규화 전체 일치, 긴 응답은 시작·중간·끝 3조각 대조."""
+    if not expected:
+        return True
+    exp = normalize(expected)
+    got = normalize(txt)
+    if len(exp) < 80:
+        return got == exp
+    probes = (exp[:30], exp[len(exp) // 2: len(exp) // 2 + 30], exp[-30:])
+    return all(p in got for p in probes if p)
+
+
+def copy_assistant_node(node, expected: str | None = None) -> str | None:
+    """대상 노드의 copy 버튼으로 클립보드 회수(마크다운 보존). sentinel로 '복사 실패', expected 대조로
+    '남의 복사'를 각각 거른다. 실패 시 None → 호출자가 DOM 텍스트로 폴백(내용 오염 < 서식 손실)."""
     if pyperclip is None:
         return None
-
-    def _matches_expected(txt: str) -> bool:
-        if not expected:
-            return True
-        exp = normalize(expected)
-        if len(exp) < 80:
-            return True  # 너무 짧으면 대조 무의미 — 통과
-        mid = len(exp) // 2
-        probe = exp[mid:mid + 30]
-        return (not probe) or (probe in normalize(txt))
-
+    btn = node_copy_button(node)
+    if btn is None:
+        return None
     try:
-        btns = _qa(page, COPY_BTN_SELECTORS)
-        if len(btns) <= base_copy:   # 새 copy 버튼이 아직 없음 → 이전 응답 회수 방지(fail-closed)
-            return None
-        btn = btns[-1]  # 증가가 확인됐으므로 마지막이 새 응답의 copy 버튼
         for _ in range(3):
             pyperclip.copy("__INSANE_REVIEW_SENTINEL__")
             btn.click(force=True)
             time.sleep(1)
             txt = pyperclip.paste()
-            # sentinel이 그대로면 복사 실패 → stale 반환 방지
-            if txt and txt != "__INSANE_REVIEW_SENTINEL__" and txt.strip() and _matches_expected(txt):
+            if txt and txt != "__INSANE_REVIEW_SENTINEL__" and txt.strip() and clipboard_matches(txt, expected):
                 return txt
             time.sleep(0.5)
         return None
@@ -1489,7 +1529,7 @@ def click_answer_now(page) -> bool:
 def wait_for_turn_response(page, force_after=None, max_wait=None,
                            base_user: int = 0, base_assistant: int = 0, base_copy: int = 0,
                            conv_url: str | None = None, base_ids: set | None = None,
-                           skip_sent_check: bool = False) -> tuple[str, str, str | None]:
+                           skip_sent_check: bool = False, on_bound=None) -> tuple[str, str, str | None]:
     """전송이 만든 '대화 URL' + message-id에 결속해 응답을 회수(v0.6.0 identity 결속).
     - conv_url: 이미 결속된 대화 URL(회수 재시도/harvest). None이면 전송 직후 SPA에서 포착.
     - base_ids: 전송 직전 DOM의 data-message-id 집합 — 신규 턴을 id 차집합으로 판정.
@@ -1520,6 +1560,12 @@ def wait_for_turn_response(page, force_after=None, max_wait=None,
         if conv_url is None:
             return ("sent_unknown_location", "", None)
         print(f"  🔗 대화 결속: {conv_url}")
+        if on_bound is not None:
+            # 결속 즉시 영속화 — 응답 대기(최대 60분) 중 프로세스가 죽어도 manifest로 --harvest 가능
+            try:
+                on_bound(conv_url)
+            except Exception:
+                pass
     _m = CONV_URL_RE.search(conv_url)
     conv_key = _m.group(0) if _m else None
 
@@ -1527,6 +1573,8 @@ def wait_for_turn_response(page, force_after=None, max_wait=None,
     print(f"    응답 대기 중... (최대 {mw}s"
           + (f", {force_after}s 후 '지금 답변 받기' 재시도" if force_after else "") + ")")
     stable_since = None
+    stall_since = None
+    reloads = 0
     last_text = ""
     deadline = start + mw
     grace_used = False
@@ -1564,19 +1612,44 @@ def wait_for_turn_response(page, force_after=None, max_wait=None,
                 if force_tries >= FORCE_MAX_TRIES:
                     print(f"    ⚠️  {elapsed}s — '지금 답변 받기' 버튼 {FORCE_MAX_TRIES}회 실패 → 자연완료 대기")
 
+        # 대상 턴(신규 assistant 노드)과 종결 신호 — 게이트별로 로그에 남겨 막힌 predicate를 바로 알 수 있게
+        node = new_assistant_node(page, base_ids, base_assistant=base_assistant)
+        cur = _node_text(node)
+        streaming = is_streaming(page)
+        terminal = turn_terminal(page, node)
+
         if elapsed - last_status >= STATUS_INTERVAL and elapsed > 0:
-            st = "⏳ 생성중" if is_streaming(page) else "정지(확인중)"
-            print(f"    {elapsed}s | {st}")
+            print(f"    {elapsed}s | " + ("⏳ 생성중" if streaming else "정지")
+                  + f" | assistant={count_msgs(page, ASSISTANT_MSG_SELECTORS)}/{base_assistant}"
+                  + f" fresh_len={len(cur.strip())} copy={'y' if node_copy_button(node) else 'n'}"
+                  + f" send={'y' if send_button_ready(page) else 'n'} terminal={'y' if terminal else 'n'}")
             last_status = elapsed
 
-        if elapsed < MIN_WAIT_SECS or is_streaming(page):
+        if elapsed < MIN_WAIT_SECS or streaming:
             stable_since = None
+            stall_since = None
             time.sleep(2)
             continue
 
-        # 완료 신호 + 텍스트 안정성 — 신규 턴은 id 차집합으로 판정(base_ids 있을 때), 완료 신호는 기존 유지
-        cur = new_assistant_text(page, base_ids) if base_ids is not None else last_assistant_text(page)
-        if not last_turn_complete(page, base_assistant=base_assistant, base_copy=base_copy) or not cur.strip():
+        # 스톨 복구(실측 2026-08-25): 스트리밍 표시도 없고 assistant 노드가 빈 채로 멈추는 클라이언트 스트림 유실.
+        # 서버엔 답이 있어 재로드하면 즉시 보인다(어제 '재시도 29초 성공'의 실체). 결속 URL로 재로드(재전송 아님).
+        if not cur.strip():
+            stall_since = stall_since or time.monotonic()
+            if time.monotonic() - stall_since >= STALL_RELOAD_SECS and reloads < STALL_MAX_RELOADS:
+                reloads += 1
+                print(f"    🔄 {elapsed}s — 응답 렌더 스톨(빈 턴/스트리밍 없음) → 결속 채팅 재로드 {reloads}/{STALL_MAX_RELOADS}")
+                try:
+                    page.goto(conv_url, wait_until="domcontentloaded", timeout=30000)
+                except Exception:
+                    pass
+                stall_since = None
+                stable_since = None
+                time.sleep(3)
+                continue
+        else:
+            stall_since = None
+
+        if not terminal or not cur.strip():
             quota_msg = detect_quota_block(page)
             if quota_msg:
                 print(f"    ⛔ 사용량 한도 감지 → 대기 중단: {quota_msg[:80]}")
@@ -1590,17 +1663,16 @@ def wait_for_turn_response(page, force_after=None, max_wait=None,
             time.sleep(2)
             continue
         if stable_since and (time.monotonic() - stable_since) >= STABLE_CHECK_SECS:
-            # 회수: copy 우선(마크다운 보존), 단 DOM 텍스트와 대조해 클립보드 경합 오염을 걸러낸다.
-            txt = copy_last_turn(page, base_copy=base_copy, expected=cur)
+            # 회수: 대상 노드의 copy 우선(마크다운 보존), 대조 실패/버튼 없음은 그 노드의 DOM 텍스트로 폴백
+            txt = copy_assistant_node(node, expected=cur)
             if txt and txt.strip():
                 print(f"    ✅ 응답 수신: {len(txt)}자 ({int(time.monotonic()-start)}s, copy)")
                 return ("ok", txt, conv_url)
-            if cur and cur.strip():
-                print(f"    ✅ 응답 수신: {len(cur)}자 ({int(time.monotonic()-start)}s, DOM)")
-                return ("ok", cur, conv_url)
+            print(f"    ✅ 응답 수신: {len(cur)}자 ({int(time.monotonic()-start)}s, DOM)")
+            return ("ok", cur, conv_url)
         time.sleep(2)
 
-    fallback = new_assistant_text(page, base_ids) if base_ids is not None else last_assistant_text(page)
+    fallback = _node_text(new_assistant_node(page, base_ids, base_assistant=base_assistant))
     return ("timeout", fallback, conv_url) if fallback else ("timeout", "", conv_url)
 
 
@@ -1679,43 +1751,123 @@ def _load_project_cache(cache_path: Path) -> dict:
 def _save_project_cache(cache_path: Path, cache: dict) -> None:
     try:
         cache_path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = cache_path.with_suffix(".json.tmp")
+        # 프로세스별 고유 tmp — 고정 이름(.json.tmp)은 동시 실행 시 서로의 tmp를 replace/삭제한다
+        tmp = cache_path.with_name(f".{cache_path.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp")
         tmp.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
         os.replace(tmp, cache_path)  # 원자적 저장
     except Exception:
         pass
 
 
+@contextmanager
+def project_cache_lock(cache_path: Path, timeout: int = 90):
+    """projects.json의 read-check-find-create-write 임계구역 직렬화(디렉터리 lock, 표준 라이브러리만).
+    lock 없이는 두 프로세스가 같은 dict를 읽고 각자 저장해 삭제가 되살아나거나 키가 유실되고,
+    둘 다 '없음' 판정 후 같은 이름의 원격 프로젝트를 중복 생성한다. 10분 넘은 lock은 죽은 프로세스로 보고 회수."""
+    lock_dir = cache_path.with_name(cache_path.name + ".lock")
+    deadline = time.monotonic() + timeout
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    while True:
+        try:
+            lock_dir.mkdir()
+            break
+        except FileExistsError:
+            try:
+                if time.time() - lock_dir.stat().st_mtime > 600:
+                    shutil.rmtree(lock_dir, ignore_errors=True)
+                    continue
+            except OSError:
+                pass
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"project cache lock timeout: {lock_dir}")
+            time.sleep(0.2)
+    try:
+        yield
+    finally:
+        shutil.rmtree(lock_dir, ignore_errors=True)
+
+
 # 워크스페이스 이동(개인→팀 등)으로 접근 불가가 된 프로젝트는 URL이 유지된 채
 # 에러 모달만 뜨는 케이스가 있어, URL 존재만으로는 생존 판정이 안 된다.
 _PROJECT_ACCESS_ERROR_RE = (
     r"이 프로젝트에 액세스할 수 없습니다|can.t access this project|"
-    r"don.t have access|올바른 계정으로 로그인"
+    r"don.t have access|올바른 계정으로 로그인|プロジェクトにアクセスできません"
 )
+_PROJECT_ID_RE = re.compile(r"(g-p-[0-9a-f]{32})", re.I)
+PROJECT_OK, PROJECT_DEAD, PROJECT_AUTH, PROJECT_UNKNOWN = "ok", "dead", "auth", "unknown"
 
 
-def project_home_ok(page, url: str) -> bool:
-    """캐시된 프로젝트 URL이 아직 살아있는지 확인.
-    조건: ① 최종 URL에 '그 프로젝트의 g-p id'가 그대로 있고 ② 접근불가 에러 텍스트가 없고 ③ 컴포저 존재.
-    (id 불일치=홈 리다이렉트, 에러 텍스트=타 워크스페이스 소속 → 모두 사망 판정)"""
+def find_visible_input(page):
+    """가시적·활성 컴포저만(#prompt-textarea 우선). 에러 모달 아래 숨은 컴포저·다른 contenteditable을 통과시키지 않는다."""
+    for sel in INPUT_SELECTORS:
+        try:
+            for el in page.query_selector_all(sel):
+                if el.is_visible() and el.is_enabled():
+                    return el
+        except Exception:
+            continue
+    return None
+
+
+def visible_alert_dialog_text(page) -> str:
+    """가시적 에러 표면([role=dialog|alert]) 텍스트만 — 본문 전체를 보면 채팅 제목/프롬프트 속 문구에 오탐한다."""
+    parts = []
+    for sel in ('[role="dialog"]', '[role="alert"]'):
+        try:
+            for node in page.query_selector_all(sel):
+                if node.is_visible():
+                    parts.append(node.inner_text() or "")
+        except Exception:
+            continue
+    return "\n".join(parts)
+
+
+def project_home_state(page, url: str, probe_secs: int = 15) -> str:
+    """프로젝트 URL 생존을 4상태로 판정(2초 단발 → 폴링 + 연속 안정 구간).
+    ok: 그 g-p id가 URL에 유지 + 가시 컴포저 + 차단 다이얼로그 없음이 4초 연속.
+    dead: id 불일치(홈 리다이렉트)·명시적 403/404·접근불가 문구 — 현 워크스페이스에서 재탐색/재생성 대상.
+    auth: 로그인 벽. unknown: 지연·네트워크·UI 변경 — 캐시 삭제·프로젝트 생성 모두 금지(fail-closed).
+    False 하나로 뭉개면 일시 오류에 정상 캐시를 지우고 중복 프로젝트를 만든다(2026-08-24 GPT Pro 리뷰)."""
+    m = _PROJECT_ID_RE.search(url)
+    if not m:
+        return PROJECT_UNKNOWN  # 파싱 실패는 identity 검사 생략 사유가 아니다
+    gp_id = m.group(1).lower()
     try:
-        m = re.search(r"(g-p-[0-9a-f]{32})", url)
-        gp_id = m.group(1) if m else None
-        page.goto(url, wait_until="domcontentloaded", timeout=30000)
-        time.sleep(2)
-        if gp_id and gp_id not in page.url:
-            return False
-        if "/g/g-p-" not in page.url:
-            return False
-        has_error = page.evaluate(
-            "(re) => new RegExp(re, 'i').test(document.body ? document.body.innerText : '')",
-            _PROJECT_ACCESS_ERROR_RE,
-        )
-        if has_error:
-            return False
-        return find_input(page) is not None
+        resp = page.goto(url, wait_until="domcontentloaded", timeout=30000)
     except Exception:
-        return False
+        return PROJECT_UNKNOWN
+    try:
+        if resp is not None:
+            if resp.status == 401:
+                return PROJECT_AUTH
+            if resp.status in (403, 404):
+                return PROJECT_DEAD
+    except Exception:
+        pass
+    deadline = time.monotonic() + probe_secs
+    healthy_since = None
+    final_url = ""
+    while time.monotonic() < deadline:
+        try:
+            final_url = current_url(page)
+            if _q(page, LOGIN_WALL_SELECTORS) is not None:
+                return PROJECT_AUTH
+            blocking = visible_alert_dialog_text(page)
+            if re.search(_PROJECT_ACCESS_ERROR_RE, blocking, re.I):
+                return PROJECT_DEAD
+            if gp_id in final_url.lower() and not blocking and find_visible_input(page) is not None:
+                if healthy_since is None:
+                    healthy_since = time.monotonic()
+                elif time.monotonic() - healthy_since >= 4:
+                    return PROJECT_OK
+            else:
+                healthy_since = None
+        except Exception:
+            healthy_since = None
+        time.sleep(0.5)
+    if final_url and gp_id not in final_url.lower():
+        return PROJECT_DEAD
+    return PROJECT_UNKNOWN
 
 
 # 다국어(사용자 ChatGPT UI 언어) 베스트에포트 — '새 프로젝트' 버튼 / '만들기' 제출 버튼.
@@ -1731,8 +1883,21 @@ def find_project_url(page, name: str) -> str | None:
     #3 대응: 어떤 예외도 삼켜 None 반환(폴백 가능)."""
     try:
         for _ in range(12):
+            # 1순위: 사이드바 안의 실제 href(클릭 휴리스틱보다 결정적) — 이름 정확 일치
+            href = page.evaluate("""(nm) => {
+                for (const root of document.querySelectorAll('nav, aside')) {
+                    for (const a of root.querySelectorAll('a[href*="/g/g-p-"]')) {
+                        const t = (a.innerText || a.textContent || '').replace(/\\s+/g, ' ').trim();
+                        if (t === nm) return new URL(a.getAttribute('href'), location.origin).href;
+                    }
+                }
+                return null;
+            }""", name)
+            if href:
+                return href
+            # 2순위(button-only UI): 사이드바 행의 표시텍스트 == 이름 → 홈 버튼 클릭(문서 전체 li는 보지 않음)
             clicked = page.evaluate("""(nm) => {
-                const lis = [...document.querySelectorAll('nav li, aside li, li')];
+                const lis = [...document.querySelectorAll('nav li, aside li')];
                 for (const li of lis) {
                     const first = ((li.innerText || '').trim().split('\\n')[0] || '').trim();
                     const btns = [...li.querySelectorAll('button[aria-label]')];
@@ -1751,10 +1916,19 @@ def find_project_url(page, name: str) -> str | None:
                 except Exception:
                     pass
                 time.sleep(1.2)
-                return page.url if "/g/g-p-" in page.url else None
-            # 가상화/접힘 대비: 스크롤 컨테이너를 끝까지 내려 더 로드한 뒤 재시도
-            page.evaluate("""() => { for (const el of document.querySelectorAll('nav *, aside *')) {
-                if (el.scrollHeight > el.clientHeight + 20) el.scrollTop = el.scrollHeight; } }""")
+                u = current_url(page)  # page.url은 SPA pushState를 반영 못 함(스테일)
+                return u if "/g/g-p-" in u else None
+            # 가상화/접힘 대비: 한 화면씩 내려가며 재탐색(끝으로 점프하면 목록 중간을 건너뛴다)
+            moved = page.evaluate("""() => { let moved = false;
+                for (const el of document.querySelectorAll('nav *, aside *')) {
+                    if (el.scrollHeight > el.clientHeight + 20) {
+                        const next = Math.min(el.scrollHeight - el.clientHeight, el.scrollTop + Math.max(200, el.clientHeight * 0.8));
+                        if (next > el.scrollTop) { el.scrollTop = next; moved = true; }
+                    }
+                }
+                return moved; }""")
+            if not moved:
+                return None
             time.sleep(0.5)
     except Exception:
         return None
@@ -1783,7 +1957,8 @@ def create_project(page, name: str) -> str | None:
             name_input.press("Enter")  # 텍스트 매칭 실패 시 언어무관 폴백
         page.wait_for_url("**/g/g-p-**", wait_until="commit", timeout=15000)
         time.sleep(2)
-        return page.url if "/g/g-p-" in page.url else None
+        u = current_url(page)
+        return u if "/g/g-p-" in u else None
     except Exception:
         try:
             page.keyboard.press("Escape")  # 모달 닫고 폴백
@@ -1797,27 +1972,59 @@ def ensure_project(page, name: str, cache_key: str, cache_path: Path) -> str | N
     #1 대응: 캐시 키는 '절대경로'(cache_key) — 같은 폴더명의 다른 경로가 캐시를 공유하지 않는다.
     #3 대응: 함수 전체를 try/except로 감싸 어떤 예외도 None으로(호출자가 일반 채팅으로 폴백)."""
     try:
-        cache = _load_project_cache(cache_path)
-        cached = cache.get(cache_key)
-        if cached and project_home_ok(page, cached):
-            return cached
-        if cached:
-            # 사망 판정된 캐시는 즉시 폐기 — 다음 런부터 죽은 URL로 goto하며 에러 팝업을 띄우지 않는다
-            cache.pop(cache_key, None)
-            _save_project_cache(cache_path, cache)
-        page.goto(CHATGPT_URL, wait_until="domcontentloaded", timeout=30000)  # 탐색/생성은 홈에서
-        time.sleep(2)
-        url = find_project_url(page, name)
-        if not url:
-            page.goto(CHATGPT_URL, wait_until="domcontentloaded", timeout=30000)
-            time.sleep(2)
-            url = create_project(page, name)
-        if url:
-            cache[cache_key] = url
-            _save_project_cache(cache_path, cache)
-        return url
+        with project_cache_lock(cache_path):
+            return _ensure_project_locked(page, name, cache_key, cache_path)
     except Exception:
         return None
+
+
+def _open_chat_home(page) -> bool:
+    page.goto(CHATGPT_URL, wait_until="domcontentloaded", timeout=30000)
+    for _ in range(10):
+        if find_visible_input(page) is not None:
+            return True
+        time.sleep(1)
+    return False
+
+
+def _ensure_project_locked(page, name: str, cache_key: str, cache_path: Path) -> str | None:
+    """정책: ok→사용 / auth→중단 / unknown→캐시 보존·생성 금지(이번 런은 일반채팅 폴백) /
+    dead→현 워크스페이스에서 탐색→생성, 대체물이 검증된 뒤에만 옛 캐시 제거.
+    탐색·생성으로 얻은 URL도 같은 validator를 통과해야 캐시에 들어간다(오클릭·늦은 리다이렉트 고착 방지)."""
+    cache = _load_project_cache(cache_path)
+    cached = cache.get(cache_key)
+    cached_state = PROJECT_UNKNOWN
+    if cached:
+        cached_state = project_home_state(page, cached)
+        if cached_state == PROJECT_OK:
+            return cached
+        if cached_state == PROJECT_AUTH:
+            return None
+        print(f"  ℹ️  캐시된 프로젝트 판정={cached_state}" + (" → 재탐색/재생성" if cached_state == PROJECT_DEAD else " → 캐시 보존, 이번 런은 폴백"))
+        if cached_state == PROJECT_UNKNOWN:
+            return None
+
+    if not _open_chat_home(page):
+        return None
+    candidate = find_project_url(page, name)
+    if candidate and project_home_state(page, candidate) != PROJECT_OK:
+        candidate = None
+    if not candidate:
+        if not _open_chat_home(page):
+            return None
+        candidate = create_project(page, name)
+        if candidate and project_home_state(page, candidate) != PROJECT_OK:
+            candidate = None
+
+    latest = _load_project_cache(cache_path)  # lock 안이지만 재읽기 — 항상 최신 dict에 갱신
+    if candidate:
+        latest[cache_key] = candidate
+        _save_project_cache(cache_path, latest)
+        return candidate
+    if cached and cached_state == PROJECT_DEAD and latest.get(cache_key) == cached:
+        latest.pop(cache_key, None)  # 대체물을 못 얻었어도 확정 사망 캐시는 제거(에러 팝업 반복 방지)
+        _save_project_cache(cache_path, latest)
+    return None
 
 
 # ===========================================================================
@@ -2080,13 +2287,8 @@ def main():
                             entered = False
                             if proj_url:
                                 try:
-                                    page.goto(proj_url, wait_until="load", timeout=60000)
-                                    time.sleep(2)
-                                    for _ in range(10):
-                                        if find_input(page):
-                                            break
-                                        time.sleep(1)
-                                    entered = find_input(page) is not None  # 컴포저 최종 확인
+                                    # 진입도 같은 validator — id 유지+가시 컴포저+차단 없음(숨은 컴포저로 오판 금지)
+                                    entered = project_home_state(page, proj_url) == PROJECT_OK
                                 except Exception as pexc:
                                     print(f"  ⚠️  프로젝트 진입 예외({str(pexc)[:50]})")
                                     entered = False
@@ -2146,13 +2348,20 @@ def main():
                             if not composer_has_prompt(page, send_prompt):
                                 raise RuntimeError("프롬프트가 입력창에 온전히 안 들어감 → 중단(첨부만/잘린 전송 방지, fail-closed)")
                         click_send(page)
+                        manifest_written = False
+
+                        def _persist_binding(url, _sp=send_prompt):
+                            nonlocal manifest_written
+                            if not manifest_written:
+                                write_run_manifest(manifest_path, url, label, run_tag, _sp, pack_path)
+                                manifest_written = True
+
                         status, text, conv_url = wait_for_turn_response(
                             page, force_after=args.force_answer_after, max_wait=mw_eff,
                             base_user=base_user, base_assistant=base_assistant,
-                            base_copy=base_copy, base_ids=base_ids_snapshot)
+                            base_copy=base_copy, base_ids=base_ids_snapshot, on_bound=_persist_binding)
                         if conv_url:
-                            # 전송 직후 디스크 영속화 — 프로세스가 죽어도 --harvest로 회수 가능(카운슬 P0 승격)
-                            write_run_manifest(manifest_path, conv_url, label, run_tag, send_prompt, pack_path)
+                            _persist_binding(conv_url)  # 결속 콜백이 못 돈 경로(전달된 URL) 보강 — 멱등
                         if status == "not_sent":
                             print("  ⚠️  user 턴 미생성(전송 안 됨) → 재시도(재전송)")
                             continue
