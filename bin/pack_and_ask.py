@@ -1875,6 +1875,32 @@ _NEW_PROJECT_RE = r"새 프로젝트|New project|新規プロジェクト|プロ
 _CREATE_SUBMIT_RE = r"프로젝트 만들기|Create project|プロジェクトを作成|^Create$|^作成$|^만들기$"
 
 
+def find_project_url_api(page, name: str) -> str | None:
+    """현 워크스페이스의 프로젝트를 백엔드 API로 표시이름 정확 일치 조회 → 홈 URL 구성.
+    실측 2026-08-25: 프로젝트가 사이드바에 a[href] 링크로 렌더되지 않고 '프로젝트' 페이지 뒤로 이동
+    → DOM 탐색이 구조적으로 실패. API가 언어·가상화·접힘 무관하고 결정적이라 1순위.
+    chatgpt.com 오리진 페이지에서만 동작. 실패는 None(호출자가 DOM 폴백)."""
+    try:
+        short = page.evaluate("""async (nm) => {
+            try {
+                const sess = await (await fetch('/api/auth/session', {credentials: 'include'})).json();
+                if (!sess || !sess.accessToken) return null;
+                const r = await fetch('/backend-api/gizmos/snorlax/sidebar?conversations_per_gizmo=0',
+                                      {credentials: 'include', headers: {Authorization: 'Bearer ' + sess.accessToken}});
+                if (!r.ok) return null;
+                const j = await r.json();
+                for (const it of (j.items || [])) {
+                    const g = it.gizmo && it.gizmo.gizmo;
+                    if (g && g.display && g.display.name === nm && g.short_url) return g.short_url;
+                }
+            } catch (e) {}
+            return null;
+        }""", name)
+        return f"{CHATGPT_URL}g/{short}/project" if short else None
+    except Exception:
+        return None
+
+
 def find_project_url(page, name: str) -> str | None:
     """사이드바에서 '표시 이름이 정확히 name'인 프로젝트의 홈 URL을 회수(SPA 라우팅). 없으면 None.
     언어무관: 행(li)의 표시텍스트 == 이름으로 찾고(aria 로컬라이즈에 의존 안 함),
@@ -1987,28 +2013,66 @@ def _open_chat_home(page) -> bool:
     return False
 
 
+def current_workspace_id(page) -> str | None:
+    """활성 ChatGPT 워크스페이스 id — `_account` 쿠키(실측 2026-08-25, localStorage `_account`와 동일).
+    개인↔팀 등 워크스페이스 전환이 프로젝트 접근성을 통째로 바꾸므로(2026-08-11 실사고) 캐시에 결속한다.
+    실패는 None — 판정 강화용 신호일 뿐, None이면 기존 URL 검증 경로만으로 동작한다."""
+    try:
+        val = page.evaluate(
+            """() => {
+                const c = document.cookie.split('; ').find(x => x.startsWith('_account='));
+                if (c) return decodeURIComponent(c.split('=').slice(1).join('='));
+                try { return JSON.parse(localStorage.getItem('_account') || 'null'); } catch (e) { return null; }
+            }""")
+        return val or None
+    except Exception:
+        return None
+
+
+def _cache_record(value):
+    """캐시 값 하위호환 파서: 구형 문자열(url) / 신형 dict({url, workspace_id}) → (url, workspace_id)."""
+    if isinstance(value, dict):
+        return value.get("url"), value.get("workspace_id")
+    return value, None
+
+
 def _ensure_project_locked(page, name: str, cache_key: str, cache_path: Path) -> str | None:
     """정책: ok→사용 / auth→중단 / unknown→캐시 보존·생성 금지(이번 런은 일반채팅 폴백) /
     dead→현 워크스페이스에서 탐색→생성, 대체물이 검증된 뒤에만 옛 캐시 제거.
-    탐색·생성으로 얻은 URL도 같은 validator를 통과해야 캐시에 들어간다(오클릭·늦은 리다이렉트 고착 방지)."""
+    탐색·생성으로 얻은 URL도 같은 validator를 통과해야 캐시에 들어간다(오클릭·늦은 리다이렉트 고착 방지).
+    워크스페이스 결속(P2): 캐시에 workspace_id를 저장, 현재 워크스페이스와 다르면 goto 없이 즉시 dead
+    (죽은 URL을 열어 에러 팝업을 띄우는 단계 자체를 생략)."""
+    ws_now = current_workspace_id(page)
     cache = _load_project_cache(cache_path)
-    cached = cache.get(cache_key)
+    cached_rec = cache.get(cache_key)
+    cached_url, cached_ws = _cache_record(cached_rec)
     cached_state = PROJECT_UNKNOWN
-    if cached:
-        cached_state = project_home_state(page, cached)
-        if cached_state == PROJECT_OK:
-            return cached
-        if cached_state == PROJECT_AUTH:
-            return None
-        print(f"  ℹ️  캐시된 프로젝트 판정={cached_state}" + (" → 재탐색/재생성" if cached_state == PROJECT_DEAD else " → 캐시 보존, 이번 런은 폴백"))
-        if cached_state == PROJECT_UNKNOWN:
-            return None
+    if cached_url:
+        if cached_ws and ws_now and cached_ws != ws_now:
+            cached_state = PROJECT_DEAD
+            print(f"  ℹ️  워크스페이스 변경 감지(캐시={cached_ws[:8]}… ≠ 현재={ws_now[:8]}…) → 현 워크스페이스에서 재탐색/재생성")
+        else:
+            cached_state = project_home_state(page, cached_url)
+            if cached_state == PROJECT_OK:
+                if ws_now and cached_ws != ws_now:
+                    cache[cache_key] = {"url": cached_url, "workspace_id": ws_now}  # 구형 레코드 승격
+                    _save_project_cache(cache_path, cache)
+                return cached_url
+            if cached_state == PROJECT_AUTH:
+                return None
+            print(f"  ℹ️  캐시된 프로젝트 판정={cached_state}" + (" → 재탐색/재생성" if cached_state == PROJECT_DEAD else " → 캐시 보존, 이번 런은 폴백"))
+            if cached_state == PROJECT_UNKNOWN:
+                return None
 
-    if not _open_chat_home(page):
-        return None
-    candidate = find_project_url(page, name)
+    candidate = find_project_url_api(page, name)  # API 1순위(현 오리진 페이지에서 즉시)
     if candidate and project_home_state(page, candidate) != PROJECT_OK:
         candidate = None
+    if not candidate:
+        if not _open_chat_home(page):
+            return None
+        candidate = find_project_url(page, name)  # DOM 폴백(구 UI/API 실패 대비)
+        if candidate and project_home_state(page, candidate) != PROJECT_OK:
+            candidate = None
     if not candidate:
         if not _open_chat_home(page):
             return None
@@ -2018,10 +2082,10 @@ def _ensure_project_locked(page, name: str, cache_key: str, cache_path: Path) ->
 
     latest = _load_project_cache(cache_path)  # lock 안이지만 재읽기 — 항상 최신 dict에 갱신
     if candidate:
-        latest[cache_key] = candidate
+        latest[cache_key] = {"url": candidate, "workspace_id": ws_now} if ws_now else candidate
         _save_project_cache(cache_path, latest)
         return candidate
-    if cached and cached_state == PROJECT_DEAD and latest.get(cache_key) == cached:
+    if cached_url and cached_state == PROJECT_DEAD and latest.get(cache_key) == cached_rec:
         latest.pop(cache_key, None)  # 대체물을 못 얻었어도 확정 사망 캐시는 제거(에러 팝업 반복 방지)
         _save_project_cache(cache_path, latest)
     return None
