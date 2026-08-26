@@ -464,6 +464,52 @@ def save_browser_choice(name_or_path: str) -> None:
     _save_config_key("browser", name_or_path)
 
 
+LAUNCH_MODES = ("foreground", "background", "headless")
+
+
+def save_launch_mode(mode: str) -> None:
+    """전용 브라우저를 어떻게 띄울지 영속화(최초 1회 선택 → 이후 재질문 없음).
+
+    foreground : 기존 동작 — 창이 뜨고 포커스를 가져간다(진행 상황을 눈으로 보고 싶을 때)
+    background : 창을 숨긴 채 실행(macOS `open -g` + 새 탭 생성 후 재숨김). **기본값** — 작업 흐름을 안 끊는다
+    headless   : 창 자체가 없다. 가장 조용하지만 ChatGPT가 헤드리스를 차단하면 로그인/전송이 실패할 수 있어
+                 --check-env로 검증된 환경에서만 권장
+    """
+    if mode not in LAUNCH_MODES:
+        return
+    _save_config_key("launch_mode", mode)
+
+
+def hide_browser_if_background() -> None:
+    """background 모드에서 브라우저 앱을 다시 숨긴다.
+
+    `open -g`로 조용히 띄워도 playwright가 `ctx.new_page()`로 새 탭을 만드는 순간
+    macOS가 그 앱을 앞으로 끌어올린다. 탭 생성 직후 이걸 호출해 다시 내린다
+    (앱만 숨길 뿐 프로세스·CDP 세션은 그대로라 자동화는 계속 동작한다)."""
+    if host_os() != "mac" or get_launch_mode() != "background":
+        return
+    proc = (_load_config().get("launch_proc_name") or "").strip()
+    if not proc:
+        return
+    try:
+        subprocess.run(
+            ["osascript", "-e",
+             f'tell application "System Events" to set visible of process "{proc}" to false'],
+            capture_output=True, timeout=5)
+    except Exception:
+        pass
+
+
+def get_launch_mode() -> str:
+    env = (os.environ.get("INSANE_REVIEW_LAUNCH_MODE") or "").strip().lower()
+    if env in LAUNCH_MODES:
+        return env
+    mode = (_load_config().get("launch_mode") or "").strip().lower()
+    # 미설정 기본값은 background — 창이 안 보이면서도 ChatGPT가 정상 브라우저로 인식한다.
+    # (headless는 컴포저를 못 받아 전송 실패, foreground는 포커스를 뺏어 작업 흐름을 끊는다. 2026-08-26 실측)
+    return mode if mode in LAUNCH_MODES else "background"
+
+
 def _slug(name: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-") or "browser"
 
@@ -536,13 +582,25 @@ def launch_browser_exe(path: str, name: str | None = None) -> bool:
         profile_dir.mkdir(parents=True, exist_ok=True)
     except OSError:
         pass
+    mode = get_launch_mode()
+    # macOS에서 앱을 다시 숨기려면 System Events용 프로세스명이 필요하다(실행파일 basename).
+    _save_config_key("launch_proc_name", Path(path).name)
     cmd = [path, f"--remote-debugging-port={CDP_PORT}",
            f"--user-data-dir={profile_dir}",
            "--no-first-run", "--no-default-browser-check"]
+    if mode == "headless":
+        # 신형 헤드리스만 CDP·쿠키가 정상 동작한다(구형 --headless는 로그인 세션이 깨짐)
+        cmd.append("--headless=new")
 
     def _spawn_and_wait(secs: int) -> bool:
         try:
-            subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if mode == "background" and host_os() == "mac":
+                # `open -g`: 창은 뜨되 포커스를 가져가지 않아 사용자의 작업 흐름을 끊지 않는다.
+                # -n(새 인스턴스)로 전용 프로필이 기존 창에 흡수되는 것을 막는다.
+                subprocess.Popen(["open", "-g", "-n", "-a", path, "--args", *cmd[1:]],
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            else:
+                subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except OSError as exc:
             print(f"  ❌ 실행 실패: {str(exc)[:80]}")
             return False
@@ -657,6 +715,7 @@ def probe_login() -> dict:
                 return res
             res["cookie"], res["cookie_exp"] = _cookie_state(ctx)
             page = ctx.new_page()
+            hide_browser_if_background()  # 새 탭 생성이 앱을 앞으로 끌어올리므로 즉시 재숨김
             _guard_dialogs(ctx, page)
             try:
                 page.goto(CHATGPT_URL, wait_until="load", timeout=30000)
@@ -745,7 +804,8 @@ def check_env(do_install: bool = False) -> int:
     # 머신 파싱용 상태 라인 — 커맨드 온보딩이 어느 단계가 막혔는지 분기에 사용(토큰 additive)
     print(f"\nSTATUS node={'ok' if node_ok else 'missing'} deps={'ok' if deps_ok else 'missing'} "
           f"browser={browser_state} login={probe['login']} cookie={probe['cookie']} "
-          f"cookie_exp={probe['cookie_exp']} saved_browser={saved_browser} os={host_os()}")
+          f"cookie_exp={probe['cookie_exp']} saved_browser={saved_browser} os={host_os()} "
+          f"launch_mode={(_load_config().get('launch_mode') or 'unset')}")
     # 설치된 크로미움 목록 — 커맨드가 브라우저 선택 AskUserQuestion을 구성하는 데 사용
     bs = detect_browsers()
     print("BROWSERS " + ",".join(n for n, _ in bs))
@@ -2123,6 +2183,9 @@ def main():
                     help="이 OS에 설치된 크로미움 계열 브라우저 목록 출력(BROWSERS 라인)")
     ap.add_argument("--launch-browser", default=None, metavar="NAME|PATH",
                     help="지정 브라우저를 전용 프로필+디버그포트로 실행(빈 문자열이면 자동 선택). 성공 시 config에 저장")
+    ap.add_argument("--set-launch-mode", default=None, choices=list(LAUNCH_MODES),
+                    help="전용 브라우저 실행 방식을 config에 저장(최초 1회 선택). "
+                         "foreground=창 뜨고 포커스 가져감 / background=창 뜨되 포커스 안 뺏음(mac) / headless=창 없음")
     ap.add_argument("--project", default=None,
                     help="채팅을 묶을 ChatGPT 프로젝트 이름(기본: 현재 폴더명). 폴더별로 채팅이 프로젝트 안에 정리됨")
     ap.add_argument("--no-project", action="store_true",
@@ -2168,6 +2231,14 @@ def main():
         if not bs:
             print("  (설치된 크로미움 계열 브라우저를 찾지 못함)")
         sys.exit(0)
+
+    if args.set_launch_mode:
+        save_launch_mode(args.set_launch_mode)
+        print(f"LAUNCH_MODE {args.set_launch_mode} 저장됨 (~/.insane-review/config.json)")
+        if args.set_launch_mode == "headless":
+            print("  주의: ChatGPT가 헤드리스를 차단하면 로그인·전송이 실패할 수 있다. "
+                  "--check-env로 login=ok 확인 후 사용할 것.")
+        return 0
 
     if args.launch_browser is not None:
         resolved = resolve_browser(args.launch_browser or None)
@@ -2307,6 +2378,7 @@ def main():
                 if ctx is None:
                     raise RuntimeError("브라우저 context 없음 (로그인된 Comet/Chrome 필요)")
                 page = ctx.new_page()
+                hide_browser_if_background()  # 새 탭 생성이 앱을 앞으로 끌어올리므로 즉시 재숨김
                 _guard_dialogs(ctx, page)
                 try:
                     if conv_url:

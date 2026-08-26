@@ -17,6 +17,10 @@ description: GPT Pro(웹 전용·API 없음 — 현 시점 최신 플래그십 �
 
 - **deps**(`playwright`·`pyperclip`): 없으면 "지금 자동 설치" 선택 → `--check-env --install`. (`npx`/repomix는 `npx -y`로 완전 자동.)
 - **browser**: 크로미움 계열 브라우저가 디버그포트(9222)에 **전용 프로필**로 떠 있어야 함(주 브라우저와 격리; Chrome 136+는 전용 프로필 없으면 CDP가 안 열림). 없으면 `--check-env`의 `BROWSERS …` 목록으로 브라우저를 고르게 한 뒤 Claude가 `pack_and_ask.py --launch-browser "<이름>"`(크로스플랫폼 mac/win/linux·전용 프로필·선택 자동 저장)을 실행. 1개뿐이면 전용 브라우저 1개 설치를 권장. (쿠키는 전용 프로필에 보존 → 로그인 유지.)
+- **launch_mode**(최초 1회 질문): STATUS에 `launch_mode=unset`이면 **AskUserQuestion으로 한 번 물어** `--set-launch-mode <값>`으로 저장한다(이후 재질문 없음). 선택지는 `background`(권장·기본) / `foreground` 둘을 앞에 두고, `headless`는 "권장 안 함" 표기와 함께 마지막에 둔다. 사용자가 답을 안 주거나 넘기면 **background로 진행**한다(미설정 기본값도 background라 그대로 동작). 값이 이미 있으면 묻지 말 것. 나중에 바꾸려면 `--set-launch-mode <값>`(env `INSANE_REVIEW_LAUNCH_MODE`가 config보다 우선). 세 모드의 실측 결과(2026-08-26, macOS):
+  - `background` **(기본)**: `open -g`로 띄우고, playwright가 새 탭을 만들 때 앱이 앞으로 나오므로 **탭 생성 직후 다시 숨긴다**. ChatGPT는 정상 브라우저로 인식 → **왕복 성공**. 포커스를 안 뺏어 작업 흐름이 안 끊긴다.
+  - `foreground`: 창이 뜨고 앞으로 나온다. 왕복은 되지만 하던 일이 끊긴다. 진행 상황을 눈으로 보고 싶을 때만.
+  - `headless`(`--headless=new`): 창이 아예 없다. **하지만 ChatGPT가 컴포저를 안 내줘 전송이 실패한다**(쿠키가 유효해도 `ChatGPT 컴포저 미확인`으로 재시도 소진 — CF 챌린지 추정). **권장하지 않음**; 굳이 쓰려면 `--check-env`로 `login=ok`를 확인하고, 실패하면 즉시 background로 되돌릴 것.
 - **login**: `--check-env`의 로그인 프로브가 `login=no`면, "방금 연 브라우저에서 chatgpt.com 로그인 + Pro 추론 선택" 후 "로그인 완료" 선택 → 재점검. **로그인은 자동 불가 → 반드시 사용자에게 요청**(에러로 끝내지 말 것).
 - **모델 Pro 티어**: 스크립트 `--model pro`가 추론단계 **Pro**를 자동선택·검증한다. Pro 티어는 플래그십 모델에만 존재하므로, 모델명을 못박지 않아도 "현 최신 플래그십 + 최대 추론"이 보장된다(GPT 버전이 올라가도 자동 추종). 안 되면 사용자가 1회 수동 설정하면 새 채팅이 상속. (특정 모델명으로 고정하려면 `--require-model "<이름>"` 옵션을 추가.)
 
