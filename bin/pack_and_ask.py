@@ -700,7 +700,7 @@ def probe_login() -> dict:
       오판하지 않고 'unknown' — 멀쩡한 세션에 재로그인을 요구하던 거짓 음성 방지.
     - cookie는 UI와 무관하게 세션 쿠키의 생사를 별도 보고(진단용)."""
     import importlib.util
-    res = {"login": "unknown", "cookie": "unknown", "cookie_exp": "-"}
+    res = {"login": "unknown", "cookie": "unknown", "cookie_exp": "-", "mode": "unknown"}
     if not (is_port_open(CDP_PORT) and cdp_browser_ok()):
         return res
     if not importlib.util.find_spec("playwright"):
@@ -713,6 +713,7 @@ def probe_login() -> dict:
             if ctx is None:
                 res["login"], res["cookie"] = "no", "missing"
                 return res
+
             res["cookie"], res["cookie_exp"] = _cookie_state(ctx)
             page = ctx.new_page()
             hide_browser_if_background()  # 새 탭 생성이 앱을 앞으로 끌어올리므로 즉시 재숨김
@@ -720,6 +721,16 @@ def probe_login() -> dict:
             try:
                 page.goto(CHATGPT_URL, wait_until="load", timeout=30000)
                 res["login"] = login_state(page, wait_secs=15)
+                if res["login"] == "ok":
+                    # Chat/Work는 sticky이고 Work엔 Pro가 없다 — 진단에 현재 모드를 노출.
+                    # 토글은 컴포저보다 늦게 렌더되므로 잠깐 기다렸다 읽는다.
+                    m = None
+                    for _ in range(12):
+                        m = read_mode(page)
+                        if m:
+                            break
+                        time.sleep(0.5)
+                    res["mode"] = "none" if m is None else (m or "unknown")
             finally:
                 try:
                     page.close()
@@ -773,7 +784,7 @@ def check_env(do_install: bool = False) -> int:
                        "전용 브라우저를 디버그포트+전용프로필로 실행(--launch-browser; 아래 BROWSERS 참고)"))
 
     # ChatGPT 로그인 프로브(브라우저 up + deps 있을 때만)
-    probe = {"login": "unknown", "cookie": "unknown", "cookie_exp": "-"}
+    probe = {"login": "unknown", "cookie": "unknown", "cookie_exp": "-", "mode": "unknown"}
     if browser_state == "ok" and deps_ok:
         probe = probe_login()
         if probe["login"] == "ok":
@@ -805,7 +816,8 @@ def check_env(do_install: bool = False) -> int:
     print(f"\nSTATUS node={'ok' if node_ok else 'missing'} deps={'ok' if deps_ok else 'missing'} "
           f"browser={browser_state} login={probe['login']} cookie={probe['cookie']} "
           f"cookie_exp={probe['cookie_exp']} saved_browser={saved_browser} os={host_os()} "
-          f"launch_mode={(_load_config().get('launch_mode') or 'unset')}")
+          f"launch_mode={(_load_config().get('launch_mode') or 'unset')} "
+          f"mode={probe.get('mode', 'unknown')}")
     # 설치된 크로미움 목록 — 커맨드가 브라우저 선택 AskUserQuestion을 구성하는 데 사용
     bs = detect_browsers()
     print("BROWSERS " + ",".join(n for n, _ in bs))
@@ -1054,6 +1066,62 @@ MODEL_SWITCHER_SELECTORS = [
 #   활성 모델명은 '모델' 행의 trailing span(예: 'GPT-5.6 Sol')에 표시된다.
 EFFORT_ITEM_SELECTORS = ['[role="menuitemradio"]', '[role="menuitem"]', '[role="option"]']
 INTELLIGENCE_PICKER_SELECTOR = '[data-testid="composer-intelligence-picker-content"]'
+
+# ---- Chat / Work 모드 (실측 2026-08-29) ----
+# 헤더 중앙 radiogroup에 'Chat'/'Work' 라디오 2개. URL·_account 쿠키가 동일해
+# workspace_id 결속으로는 구분되지 않는다. Work 모드엔 Pro 추론단계가 아예 없고
+# (슬라이더에 Pro 눈금 부재, data-max="false") pill이 '5.6 Sol 매우 높음'으로 뜬다.
+# 선택은 sticky — 사람이 웹에서 Work로 바꿔 쓰면 이후 자동 실행이 조용히 비-Pro로 나간다.
+MODE_RADIO_SELECTOR = '[role="radiogroup"] [role="radio"]'
+JS_READ_MODE = """() => {
+  const rs = [...document.querySelectorAll('[role="radiogroup"] [role="radio"]')]
+    .map(x => ({label: (x.textContent || '').trim(), checked: x.getAttribute('aria-checked') === 'true'}));
+  if (!rs.some(r => /^(chat|work)$/i.test(r.label))) return null;
+  const on = rs.find(r => r.checked);
+  return on ? on.label : '';
+}"""
+JS_CLICK_MODE = """(want) => {
+  const el = [...document.querySelectorAll('[role="radiogroup"] [role="radio"]')]
+    .find(x => (x.textContent || '').trim().toLowerCase() === want.toLowerCase());
+  if (!el) return false;
+  el.click();
+  return true;
+}"""
+
+
+def read_mode(page) -> str | None:
+    """현재 Chat/Work 모드. 토글이 없는 계정/UI면 None."""
+    try:
+        return page.evaluate(JS_READ_MODE)
+    except Exception:
+        return None
+
+
+def ensure_chat_mode(page) -> tuple[bool, str | None]:
+    """Pro가 존재하는 Chat 모드로 보정한다.
+    반환: (chat 모드 확정 여부, 관측된 모드). 토글 자체가 없으면 (True, None) —
+    구 UI/개인 계정은 애초에 모드 분기가 없으므로 통과시킨다."""
+    mode = read_mode(page)
+    if mode is None:
+        return True, None
+    if mode.lower() == "chat":
+        return True, mode
+    print(f"  ⚠️  현재 모드가 '{mode or '미상'}' — Work 모드엔 Pro가 없다. Chat으로 전환 시도")
+    try:
+        if not page.evaluate(JS_CLICK_MODE, "Chat"):
+            print("  ❌ Chat 라디오를 찾지 못함")
+            return False, mode
+    except Exception as e:
+        print(f"  ❌ 모드 전환 실패: {e}")
+        return False, mode
+    for _ in range(10):
+        time.sleep(0.5)
+        now = read_mode(page)
+        if now and now.lower() == "chat":
+            print("  ✓ Chat 모드로 전환됨")
+            return True, now
+    print("  ❌ Chat 모드 전환이 반영되지 않음")
+    return False, read_mode(page)
 
 
 def read_model_pills(page) -> list[str]:
@@ -2442,6 +2510,13 @@ def main():
                                         time.sleep(1)
                                 except Exception:
                                     pass
+
+                        # Chat/Work 게이트 — 모델 스위처를 열기 '전에' 보정한다.
+                        # Work 모드엔 Pro 눈금 자체가 없어 슬라이더 인덱스 계산이 무의미해진다.
+                        chat_ok, seen_mode = ensure_chat_mode(page)
+                        if not chat_ok and (args.model or "").lower() == "pro":
+                            raise RuntimeError(
+                                f"Chat 모드 전환 실패(현재='{seen_mode or '미상'}') — Work 모드엔 Pro가 없다 → 전송 중단(fail-closed)")
 
                         print(f"  현재 pill: {read_model_pills(page)}")
                         if args.model:
