@@ -1,5 +1,7 @@
 English | [한국어](README.ko.md) | [中文](README.zh.md) | [日本語](README.ja.md) | [Español](README.es.md)
 
+> **Fork status (v0.6.9):** this fork updates the engine for the **current ChatGPT web UI** (the model/effort picker, message markup, copy buttons and upload menu changed; the upstream v0.6.8 selectors no longer match). Verified end to end on the real site (attach → single send → bind → harvest). Not covered: Windows, an upload menu that opens upward, and a closed laptop lid (the Mac sleeps and the run pauses; `--harvest <manifest>` resumes without resending). Upstream: [fivetaku/insane-review](https://github.com/fivetaku/insane-review).
+
 # insane-review
 
 <div align="center">
