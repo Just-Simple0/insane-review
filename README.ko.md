@@ -1,5 +1,7 @@
 [English](README.md) | 한국어 | [中文](README.zh.md) | [日本語](README.ja.md) | [Español](README.es.md)
 
+> **Fork 상태 (v0.6.9):** 이 fork는 엔진을 **현재 ChatGPT 웹 UI**에 맞게 수정했습니다(모델/추론 선택, 메시지 마크업, 복사 버튼, 업로드 메뉴가 바뀌어 upstream v0.6.8 셀렉터가 더 이상 맞지 않음). 실제 사이트에서 첨부 → 1회 전송 → 결속 → 회수까지 확인했습니다. 미검증: Windows, 위로 열리는 업로드 메뉴, 노트북 덮개 닫힘(Mac이 잠들어 실행이 멈추며 `--harvest <manifest>`로 재전송 없이 이어 회수). 원본: [fivetaku/insane-review](https://github.com/fivetaku/insane-review).
+
 # insane-review
 
 <div align="center">
