@@ -16,18 +16,24 @@ force-answer 재시도, UUID/PID 파일명, repomix 버전 핀+timeout, 권한/�
 from __future__ import annotations
 
 import argparse
-from contextlib import contextmanager
+from contextlib import contextmanager, ExitStack
+from contextvars import ContextVar
+from functools import wraps
 import hashlib
 import json
 import os
 import platform
 import re
 import shutil
+import signal
 import socket
+import stat
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.request
+import urllib.parse
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -38,9 +44,11 @@ try:
 except ImportError:
     pyperclip = None
 try:
-    from playwright.sync_api import sync_playwright
+    from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 except ImportError:
     sync_playwright = None
+    class PlaywrightTimeoutError(Exception):
+        pass
 
 # ---------------------------------------------------------------------------
 # 설정 (env로 오버라이드 가능 — 하드코딩 탈피)
@@ -94,21 +102,23 @@ def _guard_dialogs(ctx, page=None):
         _attach(page)
 
 
-INPUT_SELECTORS = ["#prompt-textarea", 'div[contenteditable="true"]']
+INPUT_SELECTORS = ['div[contenteditable="true"][role="textbox"][data-composer-markdown]', "#prompt-textarea"]
 FILE_INPUT_SELECTOR = 'input[type="file"]'
 # 폴백 리스트(첫 항목=현행 실측 셀렉터, 이후=구조적 폴백) — INPUT_SELECTORS와 같은 컨벤션
 COPY_BTN_SELECTORS = [
+    'button[type="button"][aria-label="복사"]',
     'button[data-testid="copy-turn-action-button"]',
     'button[aria-label="Copy"]',
     'button[data-testid*="copy"]',
 ]
 STREAMING_BTN_SELECTORS = [
+    'button[type="button"][aria-label="중지"]',
     'button[data-testid="stop-button"]',
     'button[aria-label="Stop streaming"]',
     'button[data-testid*="stop"]',
 ]
-USER_MSG_SELECTORS = ['[data-message-author-role="user"]', 'section[data-turn="user"]', 'article[data-turn="user"]']
-ASSISTANT_MSG_SELECTORS = ['[data-message-author-role="assistant"]', 'section[data-turn="assistant"]', 'article[data-turn="assistant"]']
+USER_MSG_SELECTORS = ['[data-chatgpt-search-unit-key$=":user"]', '[data-content-search-unit-key$=":user"]', '[data-message-author-role="user"]']
+ASSISTANT_MSG_SELECTORS = ['[data-chatgpt-search-unit-key$=":assistant"]', '[data-content-search-unit-key$=":assistant"]', '[data-message-author-role="assistant"]']
 # 턴 컨테이너(실측 2026-08-25: section[data-turn]) — copy 툴바는 메시지 div 바깥, 이 컨테이너 안에 있다
 TURN_CONTAINER_SELECTOR = 'section[data-turn], article[data-turn], [data-turn]'
 
@@ -150,6 +160,8 @@ def detect_quota_block(page):
     try:
         for sel in ('[role="dialog"]', '[role="alert"]'):
             for node in page.query_selector_all(sel):
+                if not node.is_visible():
+                    continue
                 txt = (node.inner_text() or "").strip()
                 if not txt:
                     continue
@@ -185,6 +197,7 @@ FORCE_TIMEOUT_GRACE_SECS = int(os.environ.get("INSANE_REVIEW_FORCE_GRACE", "240"
 # 보여주는 순간 무너진다(2026-07-18 스테일 캡처 실측) — URL 결속이 1차 방어, id-diff가 2차.
 CONV_URL_RE = re.compile(r"/c/[0-9a-f]{8}[0-9a-f-]{4,}", re.I)
 CONV_URL_CAPTURE_SECS = int(os.environ.get("INSANE_REVIEW_URL_CAPTURE_SECS", "90"))
+VISIBLE_ERROR_GRACE_SECS = 3
 # Pro 추론단계는 20~60분이 정상 범위(실측) — Pro 선택·검증 시 기본 최대 대기를 자동 상향.
 # 사용자가 --max-wait 또는 INSANE_REVIEW_MAX_WAIT를 명시하면 그 값이 우선.
 PRO_MAX_WAIT_SECS = int(os.environ.get("INSANE_REVIEW_PRO_MAX_WAIT", "3600"))
@@ -211,6 +224,27 @@ DEFAULT_PROMPT = (
 # ===========================================================================
 # 1) repomix 패킹 (버전 핀 + timeout + returncode + 권한 + 시크릿 노트)
 # ===========================================================================
+class PackingCancelled(BaseException):
+    pass
+
+
+class PublicationUnknown(BaseException):
+    pass
+
+
+class PackOperation:
+    def __init__(self):
+        self.cancelled = False
+        self.outcome = "DEFINITELY_NOT_COMMITTED"
+        self.path = None
+        self.cleanup_failed = False
+        self.record = {}
+        self.record_root = None
+
+
+_PACK_OPERATION = ContextVar("insane_review_pack_operation", default=None)
+
+
 def pack_repo(target: Path, *, include: str | None, ignore: str | None,
               compress: bool, style: str, token_budget: int | None,
               out_path: Path, line_numbers: bool = True) -> tuple[Path, int | None]:
@@ -514,7 +548,7 @@ def _slug(name: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-") or "browser"
 
 
-def profile_dir_for(name: str) -> Path:
+def profile_dir_for(name: str, *, persist_owner: bool = True) -> Path:
     """브라우저별 전용 프로필 분리. 크로미움 계열은 브라우저(앱)마다 쿠키 암호화 키가 달라
     (mac Keychain 'X Safe Storage' 항목이 앱별), 같은 user-data-dir을 다른 브라우저로 열면
     기존 세션 쿠키가 복호화 불가 → 로그인이 통째로 깨진다. 기존 프로필(BROWSER_PROFILE_DIR)은
@@ -525,9 +559,14 @@ def profile_dir_for(name: str) -> Path:
     if not owner:
         # 소유자 미기록: 레거시 프로필이 있으면 저장된 browser(없으면 이번 브라우저)가 승계
         owner = (cfg.get("browser") if BROWSER_PROFILE_DIR.exists() else None) or name
-        _save_config_key("profile_owner", owner)
-    # owner가 절대경로로 저장됐을 수 있음(--browser <경로>) → stem으로 비교
-    owner_name = Path(owner).stem if os.path.isabs(str(owner)) else str(owner)
+        if persist_owner:
+            _save_config_key("profile_owner", owner)
+    # owner가 절대경로로 저장됐을 수 있음(--browser <경로>) → 등록된 브라우저 이름으로 정규화(없으면 stem)
+    if os.path.isabs(str(owner)):
+        resolved = resolve_browser(str(owner))
+        owner_name = resolved[0] if resolved else Path(owner).stem
+    else:
+        owner_name = str(owner)
     if _slug(owner_name) == _slug(name):
         return BROWSER_PROFILE_DIR
     return BROWSER_PROFILE_DIR.with_name(f"{BROWSER_PROFILE_DIR.name}-{_slug(name)}")
@@ -538,6 +577,14 @@ def resolve_browser(name_or_path: str | None) -> tuple[str, str] | None:
     인자 없으면 config 저장값 → 첫 감지 브라우저 순. 못 찾으면 None."""
     if name_or_path:
         if os.path.isabs(name_or_path) and Path(name_or_path).exists():
+            # 등록된 브라우저와 같은 실행파일이면 등록된 이름으로 정규화한다. 파일명(stem)을 이름으로 쓰면
+            # `--browser Chrome`과 `--browser <Chrome 절대경로>`가 서로 다른 프로필로 갈라진다(독립 리뷰 F3).
+            for name, path in detect_browsers():
+                try:
+                    if os.path.samefile(path, name_or_path):
+                        return (name, name_or_path)
+                except OSError:
+                    continue
             return (Path(name_or_path).stem, name_or_path)
         for name, path in detect_browsers():
             if name.lower() == name_or_path.lower():
@@ -550,25 +597,6 @@ def resolve_browser(name_or_path: str | None) -> tuple[str, str] | None:
             return r
     bs = detect_browsers()
     return bs[0] if bs else None
-
-
-def _kill_profile_browsers(profile_dir: Path) -> None:
-    """전용 프로필을 점유 중인 브라우저 프로세스를 정리(크로스플랫폼 best-effort).
-    전용 프로필이라 종료해도 로그인 쿠키는 디스크에 보존된다 — 스테일 인스턴스가
-    새 런치를 흡수해(같은 user-data-dir 싱글톤) 디버그 포트가 안 열리는 교착을 푼다."""
-    target = str(profile_dir)
-    try:
-        if host_os() == "win":
-            ps = ("Get-CimInstance Win32_Process | "
-                  f"Where-Object {{ $_.CommandLine -like '*{target}*' }} | "
-                  "ForEach-Object { Stop-Process -Id $_.ProcessId -Force "
-                  "-ErrorAction SilentlyContinue }")
-            subprocess.run(["powershell", "-NoProfile", "-Command", ps],
-                           capture_output=True, timeout=15)
-        else:
-            subprocess.run(["pkill", "-f", target], capture_output=True, timeout=10)
-    except Exception:
-        pass
 
 
 def launch_browser_exe(path: str, name: str | None = None) -> bool:
@@ -626,6 +654,37 @@ def launch_browser_exe(path: str, name: str | None = None) -> bool:
     return False
 
 
+def _kill_profile_browsers(profile_dir: Path) -> None:
+    """전용 프로필을 점유 중인 브라우저 프로세스를 정리(크로스플랫폼 best-effort).
+    전용 프로필이라 종료해도 로그인 쿠키는 디스크에 보존된다 — 스테일 인스턴스가
+    새 런치를 흡수해(같은 user-data-dir 싱글톤) 디버그 포트가 안 열리는 교착을 푼다."""
+    target = str(profile_dir)
+    try:
+        if host_os() == "win":
+            ps = ("Get-CimInstance Win32_Process | "
+                  f"Where-Object {{ $_.CommandLine -like '*{target}*' }} | "
+                  "ForEach-Object { Stop-Process -Id $_.ProcessId -Force "
+                  "-ErrorAction SilentlyContinue }")
+            subprocess.run(["powershell", "-NoProfile", "-Command", ps],
+                           capture_output=True, timeout=15)
+        else:
+            subprocess.run(["pkill", "-f", target], capture_output=True, timeout=10)
+    except Exception:
+        pass
+
+
+def _restart_profile_browser() -> bool:
+    """전용 프로필 브라우저를 재기동(쿠키는 디스크 보존 → 로그인 유지)."""
+    saved = _load_config().get("browser")
+    r = resolve_browser(saved) if saved else resolve_browser(None)
+    if not r:
+        return False
+    _kill_profile_browsers(profile_dir_for(r[0]))
+    time.sleep(3)
+    return launch_browser_exe(r[1], r[0])
+
+
+
 def ensure_browser(browser_arg: str | None) -> bool:
     """이미 CDP가 떠 있으면 그걸 검증·사용, 아니면 지정/감지된 브라우저를 전용 프로필로 띄운다."""
     if is_port_open():
@@ -645,17 +704,6 @@ def ensure_browser(browser_arg: str | None) -> bool:
 # 실행 중 브라우저가 디스크에서 자동 업데이트되면(스테일 인스턴스) CDP 연결이 이 에러로 깨진다.
 # 실측(2026-07-09, Chrome 150.46 실행 중 + 디스크 150.101): connect_over_cdp가 아래 메시지로 실패.
 _STALE_CDP_MARKERS = ("Browser context management is not supported",)
-
-
-def _restart_profile_browser() -> bool:
-    """전용 프로필 브라우저를 재기동(쿠키는 디스크 보존 → 로그인 유지)."""
-    saved = _load_config().get("browser")
-    r = resolve_browser(saved) if saved else resolve_browser(None)
-    if not r:
-        return False
-    _kill_profile_browsers(profile_dir_for(r[0]))
-    time.sleep(3)
-    return launch_browser_exe(r[1], r[0])
 
 
 def connect_cdp(pw):
@@ -724,13 +772,13 @@ def probe_login() -> dict:
                 if res["login"] == "ok":
                     # Chat/Work는 sticky이고 Work엔 Pro가 없다 — 진단에 현재 모드를 노출.
                     # 토글은 컴포저보다 늦게 렌더되므로 잠깐 기다렸다 읽는다.
-                    m = None
+                    m = "unknown"
                     for _ in range(12):
                         m = read_mode(page)
-                        if m:
+                        if m != "unknown":
                             break
                         time.sleep(0.5)
-                    res["mode"] = "none" if m is None else (m or "unknown")
+                    res["mode"] = mode_probe_value(m)
             finally:
                 try:
                     page.close()
@@ -866,37 +914,164 @@ def count_msgs_strict(page, selectors) -> int:
     raise RuntimeError(f"기준 메시지 수 조회 실패({selectors}): {str(last_exc)[:60]} → 전송 중단(fail-closed)")
 
 
-def is_streaming(page) -> bool:
+def ui_adapter(page) -> str:
+    if page.query_selector('button[data-codex-intelligence-trigger], [data-composer-markdown]'):
+        return "current"
+    if page.query_selector(INTELLIGENCE_PICKER_SELECTOR):
+        return "legacy_slider"
+    if page.query_selector('#prompt-textarea'):
+        return "legacy"
+    return "unsupported"
+
+
+def streaming_state(page) -> str:
     try:
-        return _q(page, STREAMING_BTN_SELECTORS) is not None
+        if ui_adapter(page) == "unsupported":
+            return "unknown"
+        buttons = page.query_selector_all(_selector_union(STREAMING_BTN_SELECTORS))
+        return "streaming" if any(b.is_visible() for b in buttons) else "absent"
     except Exception:
+        return "unknown"
+
+
+def is_streaming(page) -> bool:
+    # Unknown must never become evidence of completion.
+    return streaming_state(page) != "absent"
+
+
+def node_ids(node) -> set[str]:
+    raw = node.get_attribute("data-chatgpt-search-message-ids") or node.get_attribute("data-message-id") or ""
+    return set(raw.split())
+
+
+def message_nodes(page, role: str):
+    kind = ui_adapter(page)
+    if kind == "unsupported":
+        raise RuntimeError("미지원 메시지 UI")
+    selector = (f'[data-chatgpt-search-unit-key$=":{role}"], [data-content-search-unit-key$=":{role}"]'
+                if kind == "current" else f'[data-message-author-role="{role}"]')
+    return canonical_message_nodes(page.query_selector_all(selector), kind == "current")
+
+
+def canonical_message_nodes(nodes, current):
+    result, seen = [], set()
+    for node in nodes:
+        if current and not node_ids(node):
+            node = _closest(node, '[data-chatgpt-search-message-ids]')
+        if node is None or not node_ids(node):
+            raise RuntimeError("메시지 identity 미확인")
+        key = tuple(sorted(node_ids(node)))
+        if key not in seen:
+            result.append(node)
+            seen.add(key)
+    return result
+
+
+def user_body_text(node) -> str:
+    bubbles = node.query_selector_all('[data-user-message-bubble]')
+    if len(bubbles) == 1:
+        return bubbles[0].inner_text()
+    if len(bubbles) > 1:
+        raise RuntimeError("user 본문이 유일하지 않음")
+    if node.get_attribute("data-content-search-unit-key"):
+        return node.inner_text()
+    bodies = node.query_selector_all('[data-content-search-unit-key$=":user"]')
+    if len(bodies) == 1:
+        return bodies[0].inner_text()
+    if node.get_attribute("data-message-author-role") == "user":
+        return node.inner_text()
+    raise RuntimeError("user 본문 경계 미확인")
+
+
+# 실측(2026-10-01): 긴 user 메시지는 접혀 표시되어 본문 끝에 "… 더 보기"가 붙고, 마크다운 렌더링이
+# 인라인 코드의 백틱 등을 지워 표시 텍스트가 전송 텍스트와 달라진다. 표시 텍스트의 정확 해시 비교는
+# 정상 전송을 "본문 불일치"로 오판한다. 그래서 전송 텍스트의 '지문'(해시만 저장, 평문 저장 없음)을 둔다:
+#   lite     : 마크다운이 지우는 문자(` * _ ~ #)와 공백만 제거 — 연산자·구두점은 그대로 비교한다.
+#   skeleton : 문자·숫자만 남김, numbers: 숫자 토큰 열, ops: 연산자 열
+# lite가 일치하면 인정하고, 아니면 skeleton·numbers·ops가 '모두' 일치할 때만 인정한다(독립 리뷰 F2:
+# 기호만 달라 의미가 바뀐 본문 — `x > 0`/`x < 0`, `3.5`/`35` — 을 승인하지 않기 위함).
+_COLLAPSE_SUFFIX_RE = re.compile(r"\s*(?:…|\.\.\.)\s*(?:더 보기|Show more|See more|Read more)\s*$", re.I)
+_ASSISTANT_LABEL_RE = re.compile(r"^\s*ChatGPT\s*(?:답변|said)\s*:\s*", re.I)
+_MARKDOWN_ERASED_RE = re.compile(r"[`*_~#\s]+")
+_NUMBER_TOKEN_RE = re.compile(r"\d(?:[\d.,:/-]*\d)?")
+_OPERATOR_RE = re.compile(r"[<>=!+%&^|\\/@$]")
+
+
+def message_fingerprint(text: str | None) -> dict:
+    base = _COLLAPSE_SUFFIX_RE.sub("", text or "")
+    parts = dict(
+        lite=_MARKDOWN_ERASED_RE.sub("", base),
+        skeleton=re.sub(r"[\W_]+", "", base, flags=re.UNICODE),
+        numbers="|".join(_NUMBER_TOKEN_RE.findall(base)),
+        ops="".join(_OPERATOR_RE.findall(base)),
+    )
+    return {key: hashlib.sha256(value.encode()).hexdigest() for key, value in parts.items()}
+
+
+def fingerprint_matches(shown: str | None, stored) -> bool:
+    if not isinstance(stored, dict):
         return False
+    current = message_fingerprint(shown)
+    if current["lite"] == stored.get("lite"):
+        return True
+    return all(current[key] == stored.get(key) for key in ("skeleton", "numbers", "ops"))
+
+
+# 응답 결속/완료 판정이 던지는 고정 사유. 예외 메시지는 원칙적으로 출력하지 않는다(비밀/페이지 내용 유출 방지).
+# 아래 문자열과 '정확히' 일치할 때만 사유를 보이며, 무엇이 덧붙은 메시지는 일치하지 않아 클래스 이름만 나간다.
+SAFE_FAILURE_REASONS = frozenset({
+    "전송 user 본문 불일치", "user 본문이 유일하지 않음", "user 본문 경계 미확인",
+    "새 user 후보가 복수입니다", "해당 user의 assistant가 유일하지 않음", "assistant identity 없음",
+    "회수 대상 assistant 변경 — 자동 재결속 금지", "기존 assistant를 새 응답으로 사용할 수 없음",
+    "결속 대화 이탈", "메시지 identity 미확인", "공유 턴 user 모호", "user 턴 경계 미확인",
+    "binding checkpoint 저장 실패", "미지원 메시지 UI",
+})
+
+
+def failure_detail(exc: BaseException) -> str:
+    """실행 단계 실패의 정제된 사유: 고정 사유 목록과 정확히 일치하면 그 문구, 아니면 예외 클래스 이름만."""
+    if type(exc) is RuntimeError and len(exc.args) == 1 and exc.args[0] in SAFE_FAILURE_REASONS:
+        return exc.args[0]
+    return type(exc).__name__
+
+
+def error_surface_state(page) -> str:
+    """Only visible semantic error surfaces count; lookup failures stay unknown."""
+    try:
+        for login in page.query_selector_all('button[data-testid="login-button"], a[href*="auth/login"]'):
+            if login.is_visible():
+                return "error"
+        for node in page.query_selector_all('[role="alert"], [role="dialog"]'):
+            if not node.is_visible():
+                continue
+            text = normalize(node.inner_text()).casefold()
+            if not text:
+                continue
+            if any(h.casefold() in text for h in QUOTA_HINTS) or re.search(
+                    r"오류|문제가 발생|로그인|한도|응답.*실패|something went wrong|error|log in|sign in|failed to|try again", text):
+                return "error"
+        return "clear"
+    except Exception:
+        return "unknown"
 
 
 def msg_id_set(page) -> set:
-    """현재 DOM의 data-message-id 집합(역할 무관, 실측 2026-07-19: 모든 메시지 노드에 존재).
-    실패 시 빈 집합 — base로 쓰일 때 빈 집합은 '아무것도 제외 안 함'이라 fail-open이 아니다
-    (URL 결속이 1차 방어이므로 id는 우리 채팅 안에서만 판정에 쓰인다)."""
-    try:
-        return set(page.eval_on_selector_all(
-            "[data-message-id]", 'els => els.map(e => e.getAttribute("data-message-id"))'))
-    except Exception:
-        return set()
+    """Collect validated message IDs; an empty DOM is distinct from a failed query."""
+    return set().union(*(node_ids(n) for role in ("user", "assistant") for n in message_nodes(page, role)))
 
 
 def new_assistant_node(page, base_ids: set | None, base_assistant: int = 0):
     """회수 대상 assistant 노드. base_ids가 있으면 id 차집합의 마지막 신규 노드,
     없으면(레거시) 전송 전보다 노드가 늘었을 때만 마지막 노드. 없으면 None."""
     try:
-        nodes = page.query_selector_all(_selector_union(ASSISTANT_MSG_SELECTORS))
+        nodes = message_nodes(page, "assistant")
         if not nodes:
             return None
         if base_ids is None:
-            return nodes[-1] if len(nodes) > base_assistant else None
+            return None
         # id가 없는 컨테이너(section/article 폴백)는 차집합 판정 불가 → 제외(옛 턴을 '신규'로 오인 방지)
-        fresh = [n for n in nodes
-                 if (n.get_attribute("data-message-id") or "") and n.get_attribute("data-message-id") not in base_ids]
-        return fresh[-1] if fresh else None
+        fresh = [n for n in nodes if node_ids(n) - base_ids]
+        return fresh[0] if len(fresh) == 1 else None
     except Exception:
         return None
 
@@ -937,23 +1112,6 @@ def capture_conv_url(page, timeout_secs: int = CONV_URL_CAPTURE_SECS) -> str | N
     return None
 
 
-def write_run_manifest(path: Path, conv_url: str, label: str, run_tag: str,
-                       prompt_text: str, pack_path) -> None:
-    """전송 직후 대화 URL 등을 원자적으로 디스크에 기록 — stdout은 터미널 크래시에 유실되므로
-    manifest가 있어야 프로세스가 죽어도 --harvest로 항상 회수할 수 있다(2026-07-19 카운슬)."""
-    try:
-        data = {"chat_url": conv_url, "label": label, "run_tag": run_tag,
-                "prompt_sha256": hashlib.sha256(prompt_text.encode("utf-8")).hexdigest(),
-                "pack": str(pack_path) if pack_path else None,
-                "created_at": datetime.now().astimezone().isoformat()}
-        tmp = path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-        os.replace(tmp, path)
-        print(f"  🧾 run manifest 기록: {path.name}")
-    except Exception:
-        pass
-
-
 def normalize(text: str | None) -> str:
     return re.sub(r"\s+", " ", text).strip() if text else ""
 
@@ -977,21 +1135,28 @@ def node_copy_button(node):
     """해당 assistant 노드 '안'의 턴 복사 버튼(전역 마지막 버튼이 아님 — 코드블록 copy/다른 턴 오클릭 방지)."""
     if node is None:
         return None
-    scopes = [node]
     try:
-        container = node.evaluate_handle("(n, sel) => n.closest(sel)", TURN_CONTAINER_SELECTOR).as_element()
-        if container is not None:
-            scopes.insert(0, container)
+        current = bool(node.get_attribute("data-chatgpt-search-unit-key") or node.get_attribute("data-content-search-unit-key"))
+        boundary = '[data-turn-key]' if current else 'section[data-turn="assistant"], article[data-turn="assistant"]'
+        scope = node.evaluate_handle("(n, sel) => n.closest(sel)", boundary).as_element()
+        if scope is None:
+            return None
+        assistants = canonical_message_nodes(scope.query_selector_all(_selector_union(ASSISTANT_MSG_SELECTORS)), current)
+        if len(assistants) != 1 or node_ids(assistants[0]) != node_ids(node):
+            return None
+        selector = ('button[type="button"][aria-label="복사"]' if current
+                    else 'button[data-testid="copy-turn-action-button"]')
+        buttons = scope.query_selector_all(selector)
+        valid = [b for b in buttons if b.is_visible() and b.is_enabled() and not b.evaluate(
+            '''(b) => !!b.closest('pre, code, [data-user-message-bubble], [data-message-author-role=user], [data-chatgpt-search-unit-key$=":user"], [data-content-search-unit-key$=":user"]')''')]
+        if current:
+            # 실측(2026-10-01): 턴 단위 복사 버튼은 응답 길이와 무관하게 어시스턴트 노드 '밖' 툴바
+            # (복사/공유/소리 내어 읽기/응답 다시 생성/반응하기)에 있고, 코드 블록이 있으면 본문 노드 '안'에
+            # 코드 블록 헤더의 "복사" 버튼이 따로 생긴다(pre 밖). 완료 증거는 노드 '밖'의 유일한 버튼뿐이다.
+            valid = [b for b in valid if not b.evaluate("(b, n) => n.contains(b)", node)]
+        return valid[0] if len(valid) == 1 else None
     except Exception:
-        pass
-    for scope in scopes:
-        for sel in COPY_BTN_SELECTORS:
-            try:
-                btn = scope.query_selector(sel)
-                if btn is not None:
-                    return btn
-            except Exception:
-                continue
+        return None
     return None
 
 
@@ -1008,50 +1173,20 @@ def send_button_ready(page) -> bool:
 
 
 def turn_terminal(page, node) -> bool:
-    """대상 턴 종결 판정: 스트리밍 중 아님 + (그 노드의 copy 버튼 존재 또는 전송 버튼 복귀).
-    전역 copy 버튼 '개수 증가'를 필수 조건으로 삼던 설계는 툴바 지연/가상화/셀렉터 전환에 전부 취약해
-    완성된 답을 두고 최대 대기를 소진시켰다(2026-08-24 GPT Pro 리뷰 P0)."""
+    """Known streaming absence plus an unambiguous copy action in the bound turn."""
     if node is None or is_streaming(page):
         return False
-    return node_copy_button(node) is not None or send_button_ready(page)
+    return node_copy_button(node) is not None
 
 
 def clipboard_matches(txt: str, expected: str | None) -> bool:
-    """클립보드 경합 오염 가드. 짧은 응답(<80자)은 정규화 전체 일치, 긴 응답은 시작·중간·끝 3조각 대조."""
-    if not expected:
-        return True
-    exp = normalize(expected)
-    got = normalize(txt)
-    if len(exp) < 80:
-        return got == exp
-    probes = (exp[:30], exp[len(exp) // 2: len(exp) // 2 + 30], exp[-30:])
-    return all(p in got for p in probes if p)
-
-
-def copy_assistant_node(node, expected: str | None = None) -> str | None:
-    """대상 노드의 copy 버튼으로 클립보드 회수(마크다운 보존). sentinel로 '복사 실패', expected 대조로
-    '남의 복사'를 각각 거른다. 실패 시 None → 호출자가 DOM 텍스트로 폴백(내용 오염 < 서식 손실)."""
-    if pyperclip is None:
-        return None
-    btn = node_copy_button(node)
-    if btn is None:
-        return None
-    try:
-        for _ in range(3):
-            pyperclip.copy("__INSANE_REVIEW_SENTINEL__")
-            btn.click(force=True)
-            time.sleep(1)
-            txt = pyperclip.paste()
-            if txt and txt != "__INSANE_REVIEW_SENTINEL__" and txt.strip() and clipboard_matches(txt, expected):
-                return txt
-            time.sleep(0.5)
-        return None
-    except Exception:
-        return None
+    """Whole-content comparison retained for regression checks; harvest uses DOM only."""
+    return bool(expected) and normalize(txt) == normalize(expected)
 
 
 # ---- 모델 스위처 ----
 MODEL_SWITCHER_SELECTORS = [
+    'button[data-codex-intelligence-trigger="true"]',
     'button.__composer-pill[aria-haspopup="menu"]',   # 실측: 모델/추론 pill
     'button[data-testid="model-switcher-dropdown-button"]',
     'button[aria-label*="model" i]',
@@ -1067,66 +1202,125 @@ MODEL_SWITCHER_SELECTORS = [
 EFFORT_ITEM_SELECTORS = ['[role="menuitemradio"]', '[role="menuitem"]', '[role="option"]']
 INTELLIGENCE_PICKER_SELECTOR = '[data-testid="composer-intelligence-picker-content"]'
 
-# ---- Chat / Work 모드 (실측 2026-08-29) ----
-# 헤더 중앙 radiogroup에 'Chat'/'Work' 라디오 2개. URL·_account 쿠키가 동일해
+# ---- Chat / Work 모드 (실측 2026-08-29, 2026-09-30) ----
+# 구 UI는 radiogroup, 현 UI는 role=group 안의 Chat/Work 버튼 쌍이다. URL·_account 쿠키가 동일해
 # workspace_id 결속으로는 구분되지 않는다. Work 모드엔 Pro 추론단계가 아예 없고
 # (슬라이더에 Pro 눈금 부재, data-max="false") pill이 '5.6 Sol 매우 높음'으로 뜬다.
 # 선택은 sticky — 사람이 웹에서 Work로 바꿔 쓰면 이후 자동 실행이 조용히 비-Pro로 나간다.
 MODE_RADIO_SELECTOR = '[role="radiogroup"] [role="radio"]'
 JS_READ_MODE = """() => {
-  const rs = [...document.querySelectorAll('[role="radiogroup"] [role="radio"]')]
-    .map(x => ({label: (x.textContent || '').trim(), checked: x.getAttribute('aria-checked') === 'true'}));
-  if (!rs.some(r => /^(chat|work)$/i.test(r.label))) return null;
-  const on = rs.find(r => r.checked);
-  return on ? on.label : '';
+  const norm = s => (s || '').trim().replace(/\\s+/g, ' ').toLowerCase();
+  const modeNames = new Set(['chat', 'work']);
+  const groups = [...document.querySelectorAll('[role="group"]')];
+  const current = groups.map(g => {
+    const buttons = [...g.querySelectorAll('button')];
+    const named = buttons.map(b => ({b, label: norm(b.getAttribute('aria-label') || b.innerText || b.textContent)}));
+    const labels = named.map(x => x.label);
+    const groupLabel = norm(g.getAttribute('aria-label'));
+    const recognizedGroup = /^(composer mode|작성기 모드)$/.test(groupLabel);
+    return {g, named, candidate: labels.some(x => modeNames.has(x)) || recognizedGroup};
+  }).filter(x => x.candidate);
+  if (current.length) {
+    if (current.length !== 1) return 'unknown';
+    const named = current[0].named;
+    const chat = named.filter(x => x.label === 'chat');
+    const work = named.filter(x => x.label === 'work');
+    if (chat.length !== 1 || work.length !== 1) return 'unknown';
+    const c = chat[0].b.getAttribute('aria-pressed');
+    const w = work[0].b.getAttribute('aria-pressed');
+    if (!((c === 'true' && w === 'false') || (c === 'false' && w === 'true'))) return 'unknown';
+    return c === 'true' ? 'chat' : 'work';
+  }
+  const legacy = [...document.querySelectorAll('[role="radiogroup"]')].map(g => {
+    const radios = [...g.querySelectorAll('[role="radio"]')];
+    const named = radios.map(r => ({r, label: norm(r.getAttribute('aria-label') || r.innerText || r.textContent)}));
+    return {named, candidate: named.some(x => modeNames.has(x.label))};
+  }).filter(x => x.candidate);
+  if (!legacy.length) return 'absent';
+  if (legacy.length !== 1) return 'unknown';
+  const chat = legacy[0].named.filter(x => x.label === 'chat');
+  const work = legacy[0].named.filter(x => x.label === 'work');
+  if (chat.length !== 1 || work.length !== 1) return 'unknown';
+  const c = chat[0].r.getAttribute('aria-checked');
+  const w = work[0].r.getAttribute('aria-checked');
+  if (!((c === 'true' && w === 'false') || (c === 'false' && w === 'true'))) return 'unknown';
+  return c === 'true' ? 'chat' : 'work';
 }"""
 JS_CLICK_MODE = """(want) => {
-  const el = [...document.querySelectorAll('[role="radiogroup"] [role="radio"]')]
-    .find(x => (x.textContent || '').trim().toLowerCase() === want.toLowerCase());
-  if (!el) return false;
-  el.click();
+  if (want !== 'Chat') return false;
+  const norm = s => (s || '').trim().replace(/\\s+/g, ' ').toLowerCase();
+  const modeNames = new Set(['chat', 'work']);
+  const groups = [...document.querySelectorAll('[role="group"]')];
+  const current = groups.map(g => {
+    const named = [...g.querySelectorAll('button')].map(b => ({b, label: norm(b.getAttribute('aria-label') || b.innerText || b.textContent)}));
+    const groupLabel = norm(g.getAttribute('aria-label'));
+    return {named, candidate: named.some(x => modeNames.has(x.label)) || /^(composer mode|작성기 모드)$/.test(groupLabel)};
+  }).filter(x => x.candidate);
+  if (current.length) {
+    if (current.length !== 1) return false;
+    const chat = current[0].named.filter(x => x.label === 'chat');
+    const work = current[0].named.filter(x => x.label === 'work');
+    if (chat.length !== 1 || work.length !== 1 || chat[0].b.getAttribute('aria-pressed') !== 'false'
+        || work[0].b.getAttribute('aria-pressed') !== 'true') return false;
+    chat[0].b.click();
+    return true;
+  }
+  const legacy = [...document.querySelectorAll('[role="radiogroup"]')].map(g => {
+    const named = [...g.querySelectorAll('[role="radio"]')].map(r => ({r, label: norm(r.getAttribute('aria-label') || r.innerText || r.textContent)}));
+    return {named, candidate: named.some(x => modeNames.has(x.label))};
+  }).filter(x => x.candidate);
+  if (legacy.length !== 1) return false;
+  const chat = legacy[0].named.filter(x => x.label === 'chat');
+  const work = legacy[0].named.filter(x => x.label === 'work');
+  if (chat.length !== 1 || work.length !== 1 || chat[0].r.getAttribute('aria-checked') !== 'false'
+      || work[0].r.getAttribute('aria-checked') !== 'true') return false;
+  chat[0].r.click();
   return true;
 }"""
 
 
-def read_mode(page) -> str | None:
-    """현재 Chat/Work 모드. 토글이 없는 계정/UI면 None."""
+def read_mode(page) -> str:
+    """Return chat/work, confirmed absent, or unknown. Read errors are never absence."""
     try:
-        return page.evaluate(JS_READ_MODE)
+        value = page.evaluate(JS_READ_MODE)
+        return value if value in ("chat", "work", "absent", "unknown") else "unknown"
     except Exception:
-        return None
+        return "unknown"
 
 
-def ensure_chat_mode(page) -> tuple[bool, str | None]:
+def mode_probe_value(mode: str) -> str:
+    """Environment status distinguishes confirmed absence from observation failure."""
+    return "none" if mode == "absent" else mode if mode in ("chat", "work") else "unknown"
+
+
+def ensure_chat_mode(page) -> tuple[bool, str]:
     """Pro가 존재하는 Chat 모드로 보정한다.
-    반환: (chat 모드 확정 여부, 관측된 모드). 토글 자체가 없으면 (True, None) —
-    구 UI/개인 계정은 애초에 모드 분기가 없으므로 통과시킨다."""
+    확인된 컨트롤 부재만 통과하며, invalid/unknown은 실패한다."""
     mode = read_mode(page)
-    if mode is None:
-        return True, None
-    if mode.lower() == "chat":
-        return True, mode
-    print(f"  ⚠️  현재 모드가 '{mode or '미상'}' — Work 모드엔 Pro가 없다. Chat으로 전환 시도")
+    if mode == "chat":
+        return True, "chat"
+    if mode == "absent":
+        return True, "absent"
+    if mode != "work":
+        return False, "unknown"
     try:
         if not page.evaluate(JS_CLICK_MODE, "Chat"):
-            print("  ❌ Chat 라디오를 찾지 못함")
-            return False, mode
-    except Exception as e:
-        print(f"  ❌ 모드 전환 실패: {e}")
-        return False, mode
+            return False, "unknown"
+    except Exception:
+        return False, "unknown"
     for _ in range(10):
         time.sleep(0.5)
         now = read_mode(page)
-        if now and now.lower() == "chat":
-            print("  ✓ Chat 모드로 전환됨")
-            return True, now
-    print("  ❌ Chat 모드 전환이 반영되지 않음")
+        if now == "chat":
+            return True, "chat"
+        if now in ("unknown", "absent"):
+            return False, now
     return False, read_mode(page)
 
 
 def read_model_pills(page) -> list[str]:
     out = []
-    for el in page.query_selector_all('button.__composer-pill'):
+    for el in page.query_selector_all('button[data-codex-intelligence-trigger], button.__composer-pill'):
         try:
             t = (el.inner_text() or "").strip()
             if t:
@@ -1136,34 +1330,6 @@ def read_model_pills(page) -> list[str]:
     return out
 
 
-def _enter_effort_view(page) -> None:
-    """새 슬라이더 UI(2026-08): 팝오버가 simple 슬라이더 뷰로 열리므로
-    '고급' 클릭 → '추론 강도' hover로 옛 menuitemradio 목록을 노출시킨다.
-    구 UI(팝오버 testid 없음)면 아무것도 하지 않는다."""
-    try:
-        if not page.query_selector(INTELLIGENCE_PICKER_SELECTOR):
-            return  # 구 UI
-        # 1) '고급' 항목 클릭 (simple 뷰일 때만 존재 — advanced 뷰면 스킵)
-        for it in page.query_selector_all('[role="menuitem"]'):
-            t = (it.inner_text() or "").strip()
-            if t.startswith("고급") or t.lower().startswith("advanced"):
-                it.click()
-                time.sleep(0.8)
-                break
-        # 2) '추론 강도' 서브메뉴 트리거 hover → 추론단계 radio 노출 대기
-        for it in page.query_selector_all('[role="menuitem"][data-has-submenu]'):
-            t = (it.inner_text() or "").strip()
-            if t.startswith("추론") or "reasoning" in t.lower() or "effort" in t.lower():
-                it.hover()
-                for _ in range(10):
-                    time.sleep(0.3)
-                    if page.query_selector('[role="menuitemradio"]'):
-                        break
-                break
-    except Exception:
-        pass
-
-
 def _close_switcher(page) -> None:
     """스위처 팝오버 닫기. 새 UI에선 서브메뉴가 열려 있으면 Escape 1회는 서브메뉴만
     닫으므로, 팝오버가 사라질 때까지 최대 3회 누른다.
@@ -1171,7 +1337,7 @@ def _close_switcher(page) -> None:
     Escape가 가면 '응답 생성을 중지할까요?' 다이얼로그가 떠버린다(2026-08-18 실측)."""
     try:
         for _ in range(3):
-            if not page.query_selector(f'{INTELLIGENCE_PICKER_SELECTOR}, [role="menu"][data-state="open"]'):
+            if not page.query_selector(f'{INTELLIGENCE_PICKER_SELECTOR}, [role="menu"][data-state="open"], [role="menu"][data-radix-menu-content]'):
                 break
             page.keyboard.press("Escape")
             time.sleep(0.3)
@@ -1182,7 +1348,7 @@ def _close_switcher(page) -> None:
 def _open_switcher_raw(page) -> bool:
     """pill 클릭으로 팝오버만 연다(뷰 전환 없음). 이미 열려 있으면 그대로 True."""
     try:
-        if page.query_selector(INTELLIGENCE_PICKER_SELECTOR):
+        if page.query_selector(f'{INTELLIGENCE_PICKER_SELECTOR}, [role="menu"][data-radix-menu-content]'):
             return True
     except Exception:
         pass
@@ -1198,51 +1364,67 @@ def _open_switcher_raw(page) -> bool:
     return False
 
 
-def _open_switcher(page):
-    if _open_switcher_raw(page):
-        _enter_effort_view(page)
-        return True
-    return False
+SUPPORTED_EFFORT_SLIDER_SELECTOR = (
+    '[data-reasoning-slider] [role="slider"], '
+    '[data-model-reasoning-effort-slider] [role="slider"], '
+    '[data-testid="composer-intelligence-picker-content"] [role="slider"]')
+EFFORT_BY_INDEX = {0: "instant", 1: "standard", 2: "high", 3: "extra_high", 4: "pro"}
+NEUTRAL_EFFORT_CAPTIONS = {"추론 수준", "추론 강도", "reasoning level", "reasoning effort"}
 
 
-def _slider_value(page) -> tuple[int | None, int | None]:
-    """새 UI 슬라이더의 (현재값, 최대값). 슬라이더 없으면 (None, None)."""
+class SafeSelectionFailure(Exception):
+    """An allowlisted, preformatted diagnostic; never contains raw page text."""
+
+
+def _slider_value(page, scope=None) -> tuple[int, int, int] | None:
+    """Return validated (min, current, max) for the unique slider inside scope."""
+    if scope is None:
+        return None
     try:
-        r = page.evaluate("""() => {
-          const s = document.querySelector('[role="slider"]');
-          return s ? [ +s.getAttribute('aria-valuenow'), +s.getAttribute('aria-valuemax') ] : null;
-        }""")
-        return (r[0], r[1]) if r else (None, None)
+        sliders = scope.query_selector_all(SUPPORTED_EFFORT_SLIDER_SELECTOR)
+        if len(sliders) != 1:
+            return None
+        values = [sliders[0].get_attribute(k) for k in ("aria-valuemin", "aria-valuenow", "aria-valuemax")]
+        if any(v is None or not re.fullmatch("[0-4]", v) for v in values):
+            return None
+        minimum, current, maximum = map(int, values)
+        if minimum != 0 or not minimum <= current <= maximum <= 4:
+            return None
+        return minimum, current, maximum
     except Exception:
-        return (None, None)
+        return None
 
 
-def _set_effort_slider(page, target_idx: int) -> bool:
+def _set_effort_slider(page, target_idx: int, scope=None) -> bool:
     """새 UI(2026-08): 추론단계 슬라이더를 target_idx로 이동.
     서브메뉴 radio는 슬라이더 파티클 애니메이션의 상시 리렌더로 클릭이 detach 실패하므로
     (일반/force/좌표 클릭 전부 무효 실측), 유일하게 안정적인 경로는
     SliderControl 프로그램 focus + ArrowLeft/ArrowRight 키 입력이다."""
     try:
         for _attempt in range(2):
-            cur, mx = _slider_value(page)
-            if cur is None:
+            position = _slider_value(page, scope)
+            if position is None:
                 return False
+            _mn, cur, mx = position
             if cur == target_idx:
                 return True
-            ok = page.evaluate("""() => {
-              const c = document.querySelector('[data-model-reasoning-effort-slider]')?.closest('[role="menuitem"]');
-              if (!c) return false;
+            ok = page.evaluate("""(scope) => {
+              const root = scope || document;
+              const ss = root.querySelectorAll('[data-reasoning-slider] [role="slider"], [data-model-reasoning-effort-slider] [role="slider"], [data-testid="composer-intelligence-picker-content"] [role="slider"]');
+              if (ss.length !== 1) return false;
+              const c = ss[0].closest('[data-reasoning-slider]') || ss[0].closest('[data-model-reasoning-effort-slider]')?.closest('[role="menuitem"]');
+              if (!c || (scope && !scope.contains(c))) return false;
               c.focus();
               return document.activeElement === c;
-            }""")
+            }""", scope)
             if not ok:
                 return False
             key = "ArrowRight" if target_idx > cur else "ArrowLeft"
             for _ in range(abs(target_idx - cur)):
                 page.keyboard.press(key)
                 time.sleep(0.4)
-        cur, _mx = _slider_value(page)
-        return cur == target_idx
+        position = _slider_value(page, scope)
+        return position is not None and position[1] == target_idx
     except Exception:
         return False
 
@@ -1252,229 +1434,496 @@ EFFORT_SLIDER_FALLBACK = {"즉시": 0, "중간": 1, "높음": 2, "매우 높음"
                           "instant": 0, "standard": 1, "high": 2, "extended": 3}
 
 
-def read_menu_state(page) -> dict:
-    """열린 메뉴에서 모델명(menuitem 중 checked/selected) + 체크된 추론단계(menuitemradio aria-checked)를 읽는다."""
-    state = {"model": None, "model_source": None, "models": [], "effort_checked": None, "items": []}
-    try:
-        # 새 UI(2026-08): advanced 뷰의 '모델' 행 trailing span이 곧 활성 모델명(예: 'GPT-5.6 Sol').
-        for it in page.query_selector_all('[role="menuitem"][data-has-submenu]'):
-            t = (it.inner_text() or "").strip()
-            if t.startswith("모델") or t.lower().startswith("model"):
-                sp = it.query_selector(".trailing span")
-                name = ((sp.inner_text() or "").strip() if sp else "")[:40]
-                if name:
-                    state["model"] = name
-                    state["model_source"] = "checked"
-                    state["models"].append(name)
-                break
-    except Exception:
+EFFORT_ALIASES = {"pro": "pro", "high": "high", "높음": "high",
+                  "extra high": "extra_high", "extended": "extra_high", "매우 높음": "extra_high",
+                  "medium": "standard", "standard": "standard", "중간": "standard",
+                  "instant": "instant", "즉시": "instant"}
+
+
+def canonical_effort(text: str) -> str | None:
+    return EFFORT_ALIASES.get(normalize(text).casefold())
+
+
+def _label_effort(trigger, pill: str, model: str, current: bool,
+                  *, include_attribute: bool = True) -> tuple[str | None, bool]:
+    """Return canonical label effort evidence and whether a visible effort surface is invalid.
+
+    A validated linked slider is authoritative for the current picker. Its trigger attribute
+    remains metadata and is not treated as competing effort evidence.
+    """
+    candidates = []
+    attr = trigger.get_attribute("data-selected-reasoning-effort") if include_attribute else None
+    if attr:
+        mapped = canonical_effort(attr)
+        if mapped is None:
+            return None, True
+        candidates.append(mapped)
+    label = normalize(pill)
+    mapped = canonical_effort(label)
+    if mapped is not None:
+        candidates.append(mapped)
+    elif label.casefold() in {x.casefold() for x in NEUTRAL_EFFORT_CAPTIONS}:
         pass
+    elif not current and model and label.casefold().startswith((model + " ").casefold()):
+        suffix = label[len(model):].strip()
+        mapped = canonical_effort(suffix)
+        if mapped is None:
+            return None, True
+        candidates.append(mapped)
+    elif label:
+        return None, True
+    if len(set(candidates)) > 1:
+        return candidates[-1], True
+    return (candidates[0] if candidates else None), False
+
+
+def selection_state(page) -> dict:
+    triggers = [e for e in page.query_selector_all(_selector_union(MODEL_SWITCHER_SELECTORS)) if e.is_visible()]
+    if len(triggers) != 1:
+        raise RuntimeError("활성 모델 trigger가 유일하지 않음")
+    trigger = triggers[0]
+    tid = trigger.get_attribute("id")
+    controls = trigger.get_attribute("aria-controls")
+    menus = [m for m in page.query_selector_all('[role="menu"], ' + INTELLIGENCE_PICKER_SELECTOR)
+             if m.is_visible() and ((tid and tid in (m.get_attribute("aria-labelledby") or "").split())
+                                    or (controls and m.get_attribute("id") == controls))]
+    if len(menus) != 1:
+        raise RuntimeError("trigger에 연결된 유일 메뉴 미확인")
+    menu = menus[0]
+    current = trigger.get_attribute("data-codex-intelligence-trigger") == "true"
+    radios = menu.query_selector_all('[role="menuitemradio"]')
+    if current:
+        selected = [r for r in radios if r.get_attribute("aria-checked") == "true"
+                    and r.get_attribute("data-model-selected") == "true"]
+        if len([r for r in radios if r.get_attribute("aria-checked") == "true"]) != 1:
+            raise RuntimeError("모델 선택 표시 모순")
+    else:
+        selected = [r for r in radios if r.get_attribute("aria-checked") == "true"
+                    and canonical_effort(r.inner_text()) is None]
+    if len(selected) != 1:
+        raise RuntimeError("선택 모델 유일성 미확인")
+    model = selected[0].inner_text().strip().splitlines()[0]
+    pill = trigger.inner_text().strip()
+    sliders = menu.query_selector_all(SUPPORTED_EFFORT_SLIDER_SELECTOR)
+    if len(sliders) > 1:
+        raise RuntimeError("linked picker slider is not unique")
+    pos = _slider_value(page, menu) if sliders else None
+    if sliders and pos is None:
+        raise RuntimeError("linked picker slider range is unsupported")
+    if current and not sliders:
+        raise RuntimeError("current picker slider is missing")
+    label_effort, label_invalid = _label_effort(
+        trigger, pill, model, current, include_attribute=not bool(pos))
+    if label_invalid:
+        detail = (f"slider current={pos[1]}/{pos[2]}, effort={EFFORT_BY_INDEX[pos[1]]}; "
+                  f"label effort={label_effort or 'unknown'}" if pos else "effort label is unsupported")
+        raise SafeSelectionFailure(f"추론단계 표기가 일치하지 않아 차단했습니다 ({detail}).")
+    effort = EFFORT_BY_INDEX[pos[1]] if pos else label_effort
+    if pos and label_effort and label_effort != effort:
+        raise SafeSelectionFailure(
+            f"추론단계 표기가 일치하지 않아 차단했습니다 (slider current={pos[1]}/{pos[2]}, "
+            f"effort={effort}, label effort={label_effort}).")
+    if not pos and not current:
+        checked = [canonical_effort(r.inner_text()) for r in radios if r.get_attribute("aria-checked") == "true"
+                   and canonical_effort(r.inner_text())]
+        if len(checked) != 1 or (effort and effort != checked[0]):
+            raise RuntimeError("effort 선택 표시 모순")
+        effort = checked[0]
+    toggle = menu.query_selector('[data-model-picker-view-toggle]')
+    return {"observed_selection": model, "actual_display": toggle.inner_text().strip() if toggle else pill,
+            "effort": effort, "slider": pos, "current": current, "menu": menu,
+            "actual_model_verification": "selected_radio", "trigger_label": pill}
+
+
+def select_model(page, want: str, require_model: str | None = None) -> tuple[bool, dict | None]:
+    target = canonical_effort(want)
     try:
-        # 한 번 순회하며 (1) 모델같은 항목 전부 수집, (2) aria-checked/selected된 활성 모델 검출
-        for it in page.query_selector_all('[role="menuitem"], [role="menuitemradio"], [role="option"]'):
-            is_checked = it.get_attribute("aria-checked") == "true" or it.get_attribute("aria-selected") == "true"
-            t = (it.inner_text() or "").strip()
-            if t and re.search(r"GPT|gpt|o\d|Claude|Gemini", t):
-                name = t.splitlines()[0][:40]
-                if name not in state["models"]:
-                    state["models"].append(name)
-                if is_checked and not state["model"]:
-                    state["model"] = name
-                    state["model_source"] = "checked"
-        # 활성표시(aria-checked)를 못 찾았을 때만 첫 모델명 폴백 — 출처를 'fallback'으로 표기(검증 시 모호하면 거부)
-        if not state["model"] and state["models"]:
-            state["model"] = state["models"][0]
-            state["model_source"] = "fallback"
+        if target is None or not _open_switcher_raw(page):
+            raise RuntimeError("요청 effort/모델 메뉴 미확인")
+        before = selection_state(page)
+        position = before["slider"]
+        if position:
+            index = {"instant": 0, "standard": 1, "high": 2, "extra_high": 3, "pro": 4}[target]
+            if target == "pro" and position[2] < 4:
+                current_effort = EFFORT_BY_INDEX[position[1]]
+                raise SafeSelectionFailure(
+                    f"Pro를 사용할 수 없어 선택을 변경하지 않았습니다 (slider max={position[2]}, "
+                    f"current effort={current_effort}).")
+            if not position[0] <= index <= position[2] or not _set_effort_slider(page, index, before["menu"]):
+                raise RuntimeError("slider 이동 확인 실패")
+        else:
+            candidates = [r for r in before["menu"].query_selector_all('[role="menuitemradio"]')
+                          if canonical_effort(r.inner_text()) == target]
+            if len(candidates) != 1:
+                raise RuntimeError("effort 항목 유일성 미확인")
+            candidates[0].click()
+            if not _open_switcher_raw(page):
+                raise RuntimeError("선택 후 메뉴 재확인 실패")
+        deadline = time.monotonic() + 2
+        previous = None
+        while True:
+            after = selection_state(page)
+            model_ok = (after["observed_selection"] == before["observed_selection"]
+                        and (not require_model or require_model.casefold() in after["observed_selection"].casefold()))
+            slider_ok = not position or (after["slider"] is not None and after["slider"][1] == index)
+            public = {k: v for k, v in after.items() if k not in ("menu", "current")}
+            if model_ok and slider_ok and after["effort"] == target:
+                if previous == public:
+                    print(f"  ✓ 모델/추론단계 사전검증 완료 (effort={target})", flush=True)
+                    return True, public
+                previous = public
+            else:
+                previous = None
+            if time.monotonic() >= deadline:
+                raise RuntimeError("선택 후 모델/slider/effort 불일치")
+            time.sleep(0.25)
+    except SafeSelectionFailure as exc:
+        print(f"  ❌ {exc} 전송을 중단했습니다.", flush=True)
+        return False, None
     except Exception:
-        pass
-    try:
-        for it in page.query_selector_all('[role="menuitemradio"]'):
-            t = (it.inner_text() or "").strip()
-            state["items"].append(t)
-            # 모델 서브메뉴가 펼쳐져 있으면 모델 radio(예: 'GPT-5.6 Sol')도 menuitemradio+checked로
-            # 잡혀 추론단계 판정을 덮어쓴다 — 모델명 패턴은 effort 후보에서 제외.
-            if re.search(r"GPT|gpt|o\d|Claude|Gemini", t):
-                continue
-            if it.get_attribute("aria-checked") == "true":
-                state["effort_checked"] = t
-    except Exception:
-        pass
-    return state
-
-
-def select_model(page, want: str, require_model: str | None = None) -> tuple[bool, str | None]:
-    """모델 스위처를 열고 want(추론단계, 예: 'pro')를 선택 + 검증.
-    require_model 지정 시 모델명(예: 'GPT-5.6')이 일치하지 않으면 False(실패) 반환.
-    반환: (verified, verified_model_name)"""
-    want_l = want.lower()
-    if not _open_switcher(page):
-        print("  ⚠️  모델 스위처를 못 찾음 → 기본 모델로 진행")
+        print("  ❌ 모델/추론단계 상태를 확인할 수 없어 전송을 중단했습니다.", flush=True)
         return False, None
-
-    before = read_menu_state(page)
-    if before["model"]:
-        print(f"  메뉴 모델명: {before['model']!r} / 추론단계 목록: {before['items']}")
-
-    # require_model 검증 (모델명을 읽지 못했거나 모델명이 기대값과 다르면 즉시 중단)
-    if require_model:
-        if not before["model"]:
-            print(f"  ❌ 모델명 획득 실패 (require_model '{require_model}' 검증 불가) → 즉시 중단 (fail-closed)")
-            _close_switcher(page)
-            return False, None
-        if require_model.lower() not in before["model"].lower():
-            print(f"  ❌ 모델 불일치: 기대 '{require_model}' ≠ 메뉴 '{before['model']}' → 중단(전송 안 함)")
-            _close_switcher(page)
-            return False, None
-
-    # ---- 새 UI(2026-08, 슬라이더) 경로 ----
-    if page.query_selector(INTELLIGENCE_PICKER_SELECTOR):
-        items = before["items"]  # 예: ['즉시','중간','높음','매우 높음','Pro'] (advanced 서브메뉴 실측)
-        idx = None
-        label = None
-        for exact in (True, False):
-            for i, t in enumerate(items):
-                low = t.strip().lower()
-                if (exact and low == want_l) or (not exact and want_l in low):
-                    idx, label = i, t.strip()
-                    break
-            if idx is not None:
-                break
-        if idx is None:
-            # 서브메뉴 라벨을 못 읽은 경우 폴백: pro=슬라이더 최댓값, 그 외 고정 맵
-            _cur, mx = _slider_value(page)
-            if want_l == "pro" and mx is not None:
-                idx, label = mx, "Pro"
-            elif want_l in EFFORT_SLIDER_FALLBACK:
-                idx, label = EFFORT_SLIDER_FALLBACK[want_l], want
-        if idx is None:
-            print(f"  ⚠️  '{want}' 추론단계 항목 못 찾음(슬라이더 UI) → 기본값")
-            _close_switcher(page)
-            return False, None
-
-        # 서브메뉴가 열린 advanced 뷰에선 슬라이더 키 입력이 불안정 → 닫고 simple 뷰로 재오픈
+    finally:
         _close_switcher(page)
-        time.sleep(0.5)
-        if not _open_switcher_raw(page):
-            print("  ⚠️  슬라이더 재오픈 실패")
-            return False, None
-        slider_ok = _set_effort_slider(page, idx)
-        _close_switcher(page)
-        time.sleep(0.5)
-
-        pills = read_model_pills(page)
-        pill_txt = pills[0] if pills else ""
-        effort_verified = slider_ok and (pill_txt == label or want_l in pill_txt.lower())
-        # 모델 검증은 advanced 뷰에서 읽은 before(model_source='checked') 기준
-        model_verified = True
-        if require_model:
-            model_verified = (before["model"] is not None
-                              and require_model.lower() in before["model"].lower()
-                              and before.get("model_source") == "checked")
-        verified = model_verified and effort_verified
-        verified_model_name = f"{before['model'] or 'Unknown Model'} ({pill_txt or label})"
-        print(f"  {'✓' if verified else '⚠️'} 최종 모델 검증(슬라이더): model={before['model']} (기대:{require_model}), "
-              f"effort=슬라이더 {idx}({pill_txt or '?'}) (기대:{want}) -> 결과={'OK' if verified else '실패'}")
-        return verified, verified_model_name
-
-    # ---- 구 UI(radio 메뉴) 경로 ----
-    # 추론단계 클릭 대상 탐색
-    clicked = None
-    cands = []
-    for sel in EFFORT_ITEM_SELECTORS:
-        try:
-            cands.extend(page.query_selector_all(sel))
-        except Exception:
-            continue
-
-    for exact in (True, False):
-        for it in cands:
-            try:
-                # 서브메뉴 트리거(예: '추론 강도Pro' 행)는 클릭 대상이 아님 — 오클릭 방지.
-                if it.get_attribute("aria-haspopup"):
-                    continue
-                t = (it.inner_text() or "").strip()
-                low = t.lower()
-                if (exact and low == want_l) or (not exact and want_l in low):
-                    try:
-                        it.click(timeout=4000)
-                    except Exception:
-                        # 새 UI 서브메뉴는 애니메이션 탓에 액션ability 체크에 걸린다(2026-08-18 실측) → force 폴백
-                        it.click(force=True, timeout=4000)
-                    clicked = t.splitlines()[0][:40]
-                    time.sleep(1.5)  # 클릭 후 드롭다운이 닫히는 시간 대기
-                    break
-            except Exception:
-                continue
-        if clicked:
-            break
-
-    if not clicked:
-        print(f"  ⚠️  '{want}' 추론단계 항목 못 찾음 → 기본값")
-        _close_switcher(page)
-        return False, None
-
-    # Pro 제안: 메뉴 재오픈하여 effort_checked 및 model_checked 상태 검증
-    if not _open_switcher(page):
-        print("  ⚠️  선택 상태 검증을 위해 메뉴 재오픈 실패")
-        return False, None
-
-    after = read_menu_state(page)
-    _close_switcher(page)
-    time.sleep(0.5)
-
-    model_verified = True
-    if require_model:
-        name_ok = after["model"] is not None and require_model.lower() in after["model"].lower()
-        # 폴백(활성표시 없음)으로 잡은 모델명은 메뉴에 모델이 여러 개일 때 신뢰 불가 → fail-closed.
-        # 활성표시(checked)거나 메뉴에 모델이 하나뿐이면 폴백이라도 안전(= 활성 모델).
-        src_ok = (after.get("model_source") == "checked") or (len(after.get("models") or []) <= 1)
-        model_verified = name_ok and src_ok
-        if name_ok and not src_ok:
-            print(f"  ❌ 활성 모델 확정 불가(체크표시 없음 + 메뉴에 모델 {len(after['models'])}개: {after['models']}) → fail-closed")
-
-    effort_verified = after["effort_checked"] is not None and want_l in after["effort_checked"].lower()
-    verified = model_verified and effort_verified
-
-    verified_model = after["model"] or "Unknown Model"
-    verified_effort = after["effort_checked"] or "Default"
-    verified_model_name = f"{verified_model} ({verified_effort})"
-
-    print(f"  {'✓' if verified else '⚠️'} 최종 모델 검증: model={after['model']} (기대:{require_model}), effort={after['effort_checked']} (기대:{want}) -> 결과={'OK' if verified else '실패'}")
-    return verified, verified_model_name
 
 
 # ---- 첨부 / 입력 / 전송 ----
-def attach_file(page, path: Path) -> bool:
-    """파일 첨부 후 '파일명이 실제로 첨부 영역에 떴는지' 검증."""
+# `current`는 2026-10-01 visible accessibility UI에서 확인한 역할/이름만 사용한다.
+# legacy/unknown UI는 근거가 없어 계속 fail-closed. Enter 폴백은 활성화하지 않는다.
+_DISPATCH_ADAPTERS = {
+    "current": {
+        "click": True,
+        "enter": False,
+        "accessible_controls": True,
+        "evidence": "visible current composer exposes one enabled send button; atomic guarded click only",
+    },
+}
+_ATTACHMENT_ADAPTERS = {
+    "current": {
+        "strategy": "accessible_controls",
+        "evidence": "visible current composer exposes exact filename button, matching remove button, upload status text, and send readiness",
+    },
+}
+_SAFE_ATTACHMENT_REASONS = frozenset({
+    "unsupported", "composer_scope_ambiguous", "baseline_attachment_present",
+    "baseline_upload_pending", "baseline_filename_collision",
+    "file_input_missing_or_ambiguous", "upload_unconfirmed",
+    "add_files_control_missing_or_ambiguous",
+    "upload_action_missing", "upload_action_ambiguous", "upload_action_unowned",
+    "file_chooser_not_opened",
+    "composer_changed_during_upload", "upload_readiness_unconfirmed",
+    "attachment_evidence_failed", "ambiguous_baseline", "no_file_input",
+    "ambiguous_file_input",
+})
+
+
+def active_composer(page):
+    editors = [e for e in page.query_selector_all(_selector_union(INPUT_SELECTORS))
+               if e.is_visible() and e.is_enabled()]
+    if len(editors) != 1:
+        raise RuntimeError("활성 composer가 유일하지 않음")
+    return editors[0]
+
+
+def composer_guard(page, editor, expected=None):
+    return page.evaluate(r"""({editor, selector, expected}) => {
+        const visible = e => e.isConnected && e.getClientRects().length > 0 &&
+            getComputedStyle(e).visibility !== 'hidden' && !e.matches(':disabled') &&
+            e.getAttribute('aria-disabled') !== 'true';
+        const editors = [...document.querySelectorAll(selector)].filter(visible);
+        const norm = s => s.replace(/\s+/gu, ' ').trim();
+        return editors.length === 1 && editors[0] === editor && editor.isContentEditable &&
+            (expected === null || norm(editor.innerText) === expected);
+    }""", {"editor": editor, "selector": _selector_union(INPUT_SELECTORS),
+             "expected": normalize(expected) if expected is not None else None})
+
+
+_REMOVE_CONTROL_RE = re.compile(r"^(?:(?:remove|제거)\s+\S.*|.+\s(?:remove|제거))$", re.I)
+_ANY_UPLOAD_STATUS_RE = re.compile(
+    r"^(?:.+\s+(?:업로드 중|uploading(?:\.{3}|…)?)|uploading(?:\.{3}|…)?\s+.+)$", re.I)
+
+
+def _current_composer_scope(page, editor):
+    """Return the unique form/presentation Locator containing this active editor."""
+    for selector in ("form", '[role="presentation"]'):
+        candidates = page.locator(selector)
+        matches = []
+        for index in range(candidates.count()):
+            candidate = candidates.nth(index)
+            if candidate.evaluate("(scope, editor) => scope.contains(editor)", editor):
+                matches.append(candidate)
+        if matches:
+            return matches[0] if len(matches) == 1 else None
+    return None
+
+
+def _visible_locator_count(locator) -> int:
+    count = locator.count()
+    return sum(1 for index in range(count) if locator.nth(index).is_visible())
+
+
+def _progress_pattern(filename):
+    """이 파일의 업로드 진행 표시 정규식. 첨부 확인(Python)과 최종 전송 가드(JS)가 같은 규칙을 쓰도록 한 곳에서
+    만든다(독립 리뷰 F4: `uploading… <파일명>`을 앞 단계는 진행 중으로, 최종 가드는 진행 없음으로 해석했다)."""
+    escaped = re.escape(filename)
+    dots = r"(?:\.{3}|…)"  # rf-문자열 안에서 직접 쓰면 {3}이 f-string 값(3)으로 바뀌므로 일반 문자열로 둔다
+    suffix = rf"(?:업로드 중|uploading{dots}?|uploading)"
+    return re.compile(rf"^(?:{escaped}\s+{suffix}|uploading{dots}?\s+{escaped})$", re.I)
+
+
+def _attachment_progress_locator(scope, filename=None):
+    pattern = _progress_pattern(filename) if filename else _ANY_UPLOAD_STATUS_RE
+    return scope.get_by_text(pattern, exact=True)
+
+
+def _attachment_remove_locator(scope, filename=None):
+    if filename:
+        escaped = re.escape(filename)
+        pattern = re.compile(
+            rf"^(?:{escaped}\s+(?:remove|제거)|(?:remove|제거)\s+{escaped})$", re.I)
+    else:
+        pattern = _REMOVE_CONTROL_RE
+    return scope.get_by_role("button", name=pattern)
+
+
+_CURRENT_SEND_NAME_RE = re.compile(r"^(?:send|보내기|프롬프트 보내기)$", re.I)
+_CURRENT_ADD_FILES_RE = re.compile(r"^(?:파일 등 추가|add files|attach files|add photos and files)$", re.I)
+_CURRENT_UPLOAD_ACTION_RE = re.compile(
+    r"^(?:사진 및 파일 추가 컴퓨터에서 업로드|사진 및 파일 업로드|파일 업로드|"
+    r"컴퓨터에서 파일 업로드|컴퓨터에서 업로드|기기에서 파일 업로드|기기에서 업로드|"
+    r"파일 선택|컴퓨터에서 파일 선택|기기에서 파일 선택|"
+    r"Upload files?|Upload from computer|Choose files? from your computer|"
+    r"Select files?|Browse files?)$", re.I)
+
+
+def _current_send_locator(scope):
+    return scope.get_by_role("button", name=_CURRENT_SEND_NAME_RE, exact=True)
+
+
+def _current_send_ready(scope) -> bool:
+    buttons = _current_send_locator(scope)
+    return _visible_locator_count(buttons) == 1 and buttons.is_enabled()
+
+
+def _current_file_menu_action(page):
+    locator = page.get_by_role("button", name=_CURRENT_UPLOAD_ACTION_RE, exact=True)
+    actions = [locator.nth(index) for index in range(locator.count())
+               if locator.nth(index).is_visible() and locator.nth(index).is_enabled()]
+    if len(actions) == 1:
+        return actions[0], 1, None
+    reason = "upload_action_missing" if not actions else "upload_action_ambiguous"
+    return None, len(actions), reason
+
+
+# 실측(2026-10-01): 메뉴는 BODY 아래 id/role 없는 DIV로 렌더링되고 "+" 버튼과 left가 같다(365=365),
+# composer 바로 아래/위에 인접한다(간격 20px). 메뉴 컨테이너 = 항목의 조상 중 보이는 버튼이 2개 이상인 첫 요소.
+_MENU_ANCHOR_JS = """(action, plus) => {
+    const visible = e => e.isConnected && e.getClientRects().length > 0;
+    let menu = action.parentElement;
+    while (menu && [...menu.querySelectorAll('button')].filter(visible).length < 2) menu = menu.parentElement;
+    if (!menu || menu === document.body || menu === document.documentElement) return false;
+    const m = menu.getBoundingClientRect(), p = plus.getBoundingClientRect();
+    const gap = m.top >= p.bottom ? m.top - p.bottom : (p.top >= m.bottom ? p.top - m.bottom : -1);
+    return Math.abs(m.left - p.left) <= 8 && gap >= 0 && gap <= 64;
+}"""
+
+
+def _upload_menu_anchored(action, add_button) -> bool:
     try:
-        inp = page.query_selector(FILE_INPUT_SELECTOR)
-        if not inp:
-            print("  ⚠️  파일 입력 요소를 못 찾음 → 호출자 폴백 판단(붙여넣기 or 중단)")
+        return bool(action.evaluate(_MENU_ANCHOR_JS, add_button.element_handle()))
+    except Exception:
+        return False
+
+
+def _choose_current_file(page, scope, path: Path) -> str | None:
+    """Choose the pack through the current accessible add/upload controls.
+
+    Returns a safe failure reason, or None once the native chooser accepted this exact file.
+    Visible composer identity/readiness is verified separately after selection.
+    """
+    # 업로드 항목은 composer 폼 '밖'의 팝오버 버튼이라 조상 범위로는 소유권을 확인할 수 없다(실측 2026-10-01).
+    # 대신 이 composer의 "파일 등 추가" 버튼이 메뉴를 연 상태(aria-expanded=true)일 때만 그 항목을 인정한다.
+    # 페이지의 다른 업로더가 이미 열려 있거나 이름이 같은 버튼이 있어도 파일을 전달하지 않는다.
+    add_buttons = scope.get_by_role("button", name=_CURRENT_ADD_FILES_RE, exact=True)
+    if _visible_locator_count(add_buttons) != 1:
+        return "add_files_control_missing_or_ambiguous"
+    add_button = add_buttons.first
+
+    def _add_menu_open() -> bool:
+        try:
+            return add_button.get_attribute("aria-expanded") == "true"
+        except Exception:
             return False
-        inp.set_input_files(str(path))
-        print(f"  파일 첨부 시도: {path.name} (업로드 대기...)")
-        stem = path.stem[:14]  # 칩 라벨은 잘릴 수 있어 앞부분만 매칭
-        
-        # composer 내부 영역(form 또는 textarea의 presentation 부모)으로 locator 한정
-        # ChatGPT UI에서 파일 첨부 칩이 노출되는 영역
-        composer = page.locator("form:has(#prompt-textarea), [role='presentation']:has(#prompt-textarea)").first
-        
+
+    chooser = None
+    if not _add_menu_open():
+        try:
+            with page.expect_file_chooser(timeout=1200) as info:
+                add_button.click()
+            chooser = info.value
+        except PlaywrightTimeoutError:
+            # Current ChatGPT exposes "사진 및 파일 추가 컴퓨터에서 업로드" as a standalone button.
+            pass
+    if chooser is None:
+        if not _add_menu_open():
+            return "upload_action_unowned"
+        action, _action_count, action_error = _current_file_menu_action(page)
+        if action is None:
+            return action_error
+        # aria-expanded만으로는 '클릭할 항목'이 이 메뉴 소속임을 보장하지 못한다(독립 리뷰 F1). 실측상 메뉴에는
+        # aria-controls/id가 없으므로, 항목이 속한 메뉴가 이 composer의 "+" 버튼에 정렬·인접해 있을 때만 인정한다.
+        if not _upload_menu_anchored(action, add_button):
+            return "upload_action_unowned"
+
+    if chooser is None:
+        try:
+            with page.expect_file_chooser(timeout=5000) as info:
+                action.click()
+            chooser = info.value
+        except PlaywrightTimeoutError:
+            return "file_chooser_not_opened"
+
+    chooser.set_files(str(path))
+    # The chooser is bound to the exact path above. Some composer change handlers
+    # immediately clear/recreate their transient file input, so reading chooser.element
+    # after set_files can see an empty FileList even though the UI accepted the upload.
+    # _attach_file_current verifies the exact visible filename, matching remove control,
+    # finished upload state and enabled Send twice; dispatch rechecks them atomically.
+    return None
+
+
+def _attach_file_current(page, path: Path) -> dict:
+    result = {"state": "not_attempted", "fallback_allowed": False, "reason": "unsupported"}
+    try:
+        editor = active_composer(page)
+        scope = _current_composer_scope(page, editor)
+        if scope is None or not composer_guard(page, editor):
+            result["reason"] = "composer_scope_ambiguous"
+            return result
+
+        # Do not send an existing draft attachment along with the review pack.
+        if _visible_locator_count(_attachment_remove_locator(scope)):
+            result["reason"] = "baseline_attachment_present"
+            print("  ❌ composer에 기존 파일 첨부가 있습니다. 기존 첨부를 확인·제거한 뒤 다시 실행하세요.", flush=True)
+            return result
+        if _visible_locator_count(_attachment_progress_locator(scope)):
+            result["reason"] = "baseline_upload_pending"
+            print("  ❌ composer에 완료되지 않은 파일 업로드가 있습니다. 업로드 상태를 정리한 뒤 다시 실행하세요.", flush=True)
+            return result
+
+        file_buttons = scope.get_by_role("button", name=path.name, exact=True)
+        if _visible_locator_count(file_buttons):
+            result["reason"] = "baseline_filename_collision"
+            return result
+        result.update(state="attempted_unconfirmed", reason="upload_unconfirmed")
+        # Some ChatGPT builds create the file input only after opening the visible add/upload menu.
+        failure = _choose_current_file(page, scope, path)
+        if failure:
+            result["reason"] = failure
+            return result
+
+        previous_ready = False
         for _ in range(40):
+            if not composer_guard(page, editor):
+                result["reason"] = "composer_changed_during_upload"
+                return result
+            file_buttons = scope.get_by_role("button", name=path.name, exact=True)
+            remove_buttons = _attachment_remove_locator(scope, path.name)
+            progress = _attachment_progress_locator(scope, path.name)
+            file_count = _visible_locator_count(file_buttons)
+            remove_count = _visible_locator_count(remove_buttons)
+            pending_count = _visible_locator_count(progress)
+            send_ready = _current_send_ready(scope)
+            signature = (file_count, remove_count, pending_count, send_ready)
+            ready = signature == (1, 1, 0, True)
+            if ready and previous_ready:
+                result.update(state="confirmed", reason="new_accessible_attachment_ready",
+                              identity=path.name, filename=path.name)
+                print("  ✓ 새 파일명 첨부와 업로드 준비 완료를 확인했습니다.", flush=True)
+                return result
+            previous_ready = ready
             time.sleep(1)
-            try:
-                # composer 내부에서만 stem 텍스트를 갖는 칩(요소) 검색
-                chip = composer.get_by_text(stem, exact=False)
-                if chip.count() > 0:
-                    print("  ✓ 첨부 확인됨 (composer 내 파일명 노출)")
-                    time.sleep(1.5)
-                    return True
-            except Exception:
-                pass
-        print("  ❌ 첨부 칩(파일명) 확인 실패 — fail-closed (잘못된 컨텍스트 전송 방지)")
-        return False
-    except Exception as exc:
-        print(f"  ❌ 첨부 실패({str(exc)[:60]})")
-        return False
+        result["reason"] = "upload_readiness_unconfirmed"
+        return result
+    except Exception:
+        result["reason"] = "attachment_evidence_failed"
+        return result
+    finally:
+        if result["state"] == "attempted_unconfirmed":
+            print(f"  ❌ '{path.name}' 첨부 준비를 확인하지 못했습니다. 파일명이 composer에 남아 있으면 '{path.name} 제거' 버튼으로 정리한 뒤 재시도하세요.", flush=True)
+
+
+def attachment_snapshot(scope, editor, adapter):
+    return scope.evaluate("""(scope, {editor, adapter}) => {
+        const visible = e => e.isConnected && e.getClientRects().length > 0 &&
+            getComputedStyle(e).visibility !== 'hidden';
+        if (!editor.isConnected || !scope.contains(editor)) throw Error('composer changed');
+        const chips = [...scope.querySelectorAll(adapter.chip)].filter(visible);
+        if (chips.some(e => e.contains(editor) || editor.contains(e))) throw Error('bad chip scope');
+        const pending = new Set();
+        for (const progress of [...scope.querySelectorAll(adapter.progress)].filter(visible)) {
+            const owners = chips.filter(chip => chip.contains(progress));
+            if (owners.length !== 1 || !owners[0].getAttribute(adapter.identity))
+                throw Error('unidentified or ambiguous upload in progress');
+            pending.add(owners[0]);
+        }
+        return chips.map(e => ({id:e.getAttribute(adapter.identity),
+            names: adapter.names.map(a => a === 'text' ? e.innerText.trim() : e.getAttribute(a)),
+            ready:e.matches(adapter.ready) && !pending.has(e)}));
+    }""", {"editor": editor, "adapter": adapter})
+
+
+def attach_file(page, path: Path) -> dict:
+    result = {"state": "not_attempted", "fallback_allowed": False, "reason": "unsupported"}
+    try:
+        adapter = _ATTACHMENT_ADAPTERS.get(ui_adapter(page))
+        if not adapter or not adapter.get("evidence"):
+            print("  첨부 unsupported — 새 파일 identity/readiness의 실제 UI 근거 없음", flush=True)
+            return result
+        if adapter.get("strategy") == "accessible_controls":
+            return _attach_file_current(page, path)
+        editor = active_composer(page)
+        scope = editor.evaluate_handle("el => el.closest('form') || el.closest('[role=presentation]')").as_element()
+        if scope is None:
+            return result
+        baseline = attachment_snapshot(scope, editor, adapter)
+        ids = [c["id"] for c in baseline]
+        if any(not i for i in ids) or len(set(ids)) != len(ids):
+            result["reason"] = "ambiguous_baseline"
+            return result
+        if any(not c["ready"] for c in baseline):
+            result["reason"] = "baseline_upload_pending"
+            return result
+        inputs = scope.query_selector_all(FILE_INPUT_SELECTOR)
+        if not inputs:
+            result.update(fallback_allowed=not baseline, reason="no_file_input")
+            return result
+        if len(inputs) != 1:
+            result["reason"] = "ambiguous_file_input"
+            return result
+        result.update(state="attempted_unconfirmed", reason="upload_unconfirmed")
+        inputs[0].set_input_files(str(path))
+        # Assignment is correlation evidence only, never readiness evidence.
+        metadata = inputs[0].evaluate("e => [...e.files].map(f => ({name:f.name,size:f.size}))")
+        if metadata != [{"name": path.name, "size": path.stat().st_size}]:
+            return result
+        for _ in range(40):
+            if not composer_guard(page, editor):
+                return result
+            chips = attachment_snapshot(scope, editor, adapter)
+            current_ids = [c["id"] for c in chips]
+            if any(not i for i in current_ids) or len(set(current_ids)) != len(current_ids):
+                return result
+            fresh = [c for c in chips if c["id"] not in ids]
+            if len(fresh) == 1 and path.name in fresh[0]["names"] and fresh[0]["ready"]:
+                result.update(state="confirmed", reason="new_attachment_ready", identity=fresh[0]["id"])
+                print("  ✓ 이번 파일의 새 첨부 identity/준비 완료 확인", flush=True)
+                return result
+            time.sleep(1)
+        return result
+    except Exception:
+        result["reason"] = "attachment_evidence_failed"
+        return result
 
 
 def build_paste_fallback(prompt: str, pack_path: Path) -> str | None:
@@ -1498,85 +1947,164 @@ SEND_BTN_SELECTORS = [
 ]
 
 
-def put_text(page, message: str):
-    page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-    time.sleep(0.3)
-    page.evaluate(
-        """() => { const el = document.querySelector('#prompt-textarea')
-            || document.querySelector('div[contenteditable=\\"true\\"]');
-            if (el) { el.scrollIntoView({block:'center'}); el.focus(); } }"""
-    )
-    time.sleep(0.3)
-    # 크로스플랫폼: OS 클립보드/⌘V(맥 전용) 대신 Playwright 네이티브 insert_text(insertText 이벤트).
-    # → mac/win/linux 동일 동작 + 동시 실행 시 클립보드 경합 제거. 실패 시 키 입력 폴백.
+def put_text(page, message: str, composer=None):
+    editor = composer if composer is not None else active_composer(page)
+    if not composer_guard(page, editor):
+        raise RuntimeError("입력 composer 변경/미확인")
+    editor.fill(message)
+    return editor
+
+
+def read_composer_text(page, composer=None) -> str:
+    editor = composer if composer is not None else active_composer(page)
+    if not composer_guard(page, editor):
+        raise RuntimeError("읽기 composer 변경/미확인")
+    return editor.inner_text()
+
+
+def composer_has_prompt(page, prompt: str, composer=None) -> bool:
     try:
-        page.keyboard.insert_text(message)
+        return normalize(read_composer_text(page, composer)) == normalize(prompt)
     except Exception:
-        page.keyboard.type(message)
-    time.sleep(0.6)
-
-
-def read_composer_text(page) -> str:
-    """입력창(composer)에 현재 들어있는 텍스트를 읽는다(전송 전 프롬프트 입력 검증용)."""
-    try:
-        return page.evaluate(
-            """() => { const el = document.querySelector('#prompt-textarea')
-                || document.querySelector('div[contenteditable=\\"true\\"]');
-                return el ? (el.innerText || el.textContent || '') : ''; }"""
-        ) or ""
-    except Exception:
-        return ""
-
-
-def composer_has_prompt(page, prompt: str) -> bool:
-    """프롬프트 '전체'가 composer에 들어갔는지 검증(앞 24자 가드가 아니라 동일성).
-    잘림(want⊄got)·중복/오염(got가 과도하게 김) 모두 fail-closed로 거부 → '첨부만/잘린 질문' 전송 차단."""
-    want = normalize(prompt)
-    if not want:
-        return True
-    got = normalize(read_composer_text(page))
-    if want not in got:                  # 일부만 입력(잘림) → 거부
         return False
-    if got.count(want) > 1:              # 프롬프트가 통째로 2번 이상(중복 입력) → 거부(길이 무관)
-        return False
-    if len(got) > len(want) * 1.5 + 20:  # 그 외 오염 payload → 거부
-        return False
-    return True
 
 
-def clear_composer(page):
-    """재입력 전 composer를 비운다(중복 입력 방지)."""
-    try:
-        page.evaluate(
-            """() => { const el = document.querySelector('#prompt-textarea')
-                || document.querySelector('div[contenteditable=\\"true\\"]');
-                if (el) { el.focus(); } }"""
-        )
-        page.keyboard.press("Meta+a")
-        page.keyboard.press("Backspace")
-        time.sleep(0.2)
-    except Exception:
-        pass
+def clear_composer(page, composer=None):
+    editor = composer if composer is not None else active_composer(page)
+    if not composer_guard(page, editor):
+        raise RuntimeError("지우기 composer 변경/미확인")
+    editor.fill("")
 
 
-def click_send(page) -> bool:
-    """전송 버튼이 visible·enabled 될 때까지 폴링 후 클릭(첨부 처리 시간 대비). 끝까지 안 되면 Enter."""
-    for _ in range(15):  # 최대 ~15s 대기
-        for sel in SEND_BTN_SELECTORS:
-            try:
-                btn = page.query_selector(sel)
-                if btn and btn.is_visible() and btn.is_enabled():
-                    btn.click()
-                    print("  ✓ 전송 버튼 클릭")
-                    time.sleep(1)
-                    return True
-            except Exception:
-                continue
+def _guarded_dispatch(page, editor, expected, button, mode, attachment=None, accessible_send=False):
+    # One synchronous JS task: no await/focus/scroll/API action after the guard.
+    return page.evaluate(r"""({editor, expected, button, mode, selector, sendSelector, attachment, accessibleSend}) => {
+        const visible = e => e && e.isConnected && e.getClientRects().length > 0 &&
+            getComputedStyle(e).visibility !== 'hidden' && !e.matches(':disabled') &&
+            e.getAttribute('aria-disabled') !== 'true';
+        const editors = [...document.querySelectorAll(selector)].filter(visible);
+        const norm = s => s.replace(/\s+/gu, ' ').trim();
+        if (editors.length !== 1 || editors[0] !== editor || !editor.isContentEditable ||
+            norm(editor.innerText) !== expected) return false;
+        const scope = editor.closest('form') || editor.closest('[role="presentation"]');
+        const labels = e => {
+            const result = [e.getAttribute('aria-label'), e.getAttribute('title'), e.innerText, e.textContent];
+            const labelledBy = e.getAttribute('aria-labelledby');
+            if (labelledBy) for (const id of labelledBy.split(/\s+/)) {
+                const ref = document.getElementById(id);
+                if (ref) result.push(ref.innerText || ref.textContent || '');
+            }
+            return result.map(x => norm(x || '')).filter(Boolean);
+        };
+        if ((attachment || accessibleSend) && (!scope || !scope.contains(editor))) return false;
+        if (attachment) {
+            const filename = norm(attachment.filename || attachment.identity || '');
+            if (!filename) return false;
+            const candidates = [...scope.querySelectorAll('button')].filter(visible);
+            const fileButtons = candidates.filter(b => labels(b).includes(filename));
+            const isRemove = s => {
+                const n = norm(s).toLowerCase(), f = filename.toLowerCase();
+                return n === `${f} 제거` || n === `${f} remove` ||
+                    n === `제거 ${f}` || n === `remove ${f}`;
+            };
+            const removeButtons = candidates.filter(b => labels(b).some(isRemove));
+            const allRemoveButtons = candidates.filter(b => labels(b).some(s => /^(?:(?:remove|제거)\s+\S.*|.+\s(?:remove|제거))$/i.test(s)));
+            if (fileButtons.length !== 1 || removeButtons.length !== 1 || allRemoveButtons.length !== 1)
+                return false;
+            if ([...scope.querySelectorAll('[role="progressbar"]')].some(visible)) return false;
+            const progressRe = new RegExp(attachment.progressPattern, 'i');
+            // 실측(2026-10-01): 업로드 중에는 role=progressbar의 aria-label이 "<파일명> 업로드 중"이기도 하다.
+            if ([...scope.querySelectorAll('*')].some(e => {
+                if (!visible(e) || editor.contains(e) || e === editor) return false;
+                return progressRe.test(norm(e.innerText || e.textContent || '')) ||
+                    progressRe.test(norm(e.getAttribute('aria-label') || ''));
+            })) return false;
+        }
+        if (mode === 'click') {
+            const buttons = accessibleSend
+                ? [...scope.querySelectorAll('button')].filter(visible).filter(b =>
+                    labels(b).some(s => /^(?:send|보내기|프롬프트 보내기)$/i.test(s)))
+                : [...document.querySelectorAll(sendSelector)].filter(visible);
+            if (buttons.length !== 1 || buttons[0] !== button) return false;
+            button.click();
+        } else {
+            if (document.activeElement !== editor) return false;
+            editor.dispatchEvent(new KeyboardEvent('keydown', {key:'Enter',code:'Enter',bubbles:true,cancelable:true}));
+        }
+        return true;
+    }""", {"editor": editor, "expected": normalize(expected), "button": button,
+             "mode": mode, "selector": _selector_union(INPUT_SELECTORS),
+             "sendSelector": _selector_union(SEND_BTN_SELECTORS),
+             "attachment": (dict(attachment, progressPattern=_progress_pattern(
+                 str(attachment.get("filename") or attachment.get("identity") or "")).pattern)
+                 if attachment else attachment),
+             "accessibleSend": accessible_send})
+
+
+DISPATCH_REASONS = {
+    "preparation": "전송 준비/검증 실패",
+    "checkpoint": "전송 전 checkpoint 저장 실패",
+    "unsupported": "전송 adapter unsupported",
+    "guard": "전송 직전 composer/본문/첨부/대상 불일치",
+    "activation": "전송 활성화 결과 미확정",
+}
+
+
+def click_send(page, expected_prompt, composer_handle, dispatch=None, attachment=None) -> bool:
+    # Runtime evidence is separate from the durable SEND_PENDING intent record.
+    if dispatch is None:
+        dispatch = {}
+    dispatch.update(state="NOT_DISPATCHED", reason="preparation")
+    adapter = _DISPATCH_ADAPTERS.get(ui_adapter(page))
+    if not adapter or not adapter.get("evidence"):
+        dispatch["reason"] = "unsupported"
+        raise RuntimeError("guarded dispatch unsupported — 실제 UI activation 근거 없음")
+    accessible_send = bool(adapter.get("accessible_controls"))
+    # Read failures and validation failures never authorize Enter fallback.
+    for _ in range(15):
+        if accessible_send:
+            scope = _current_composer_scope(page, composer_handle)
+            if scope is None:
+                raise RuntimeError("current composer 범위 미확인")
+            controls = _current_send_locator(scope)
+            buttons = [controls.nth(i).element_handle() for i in range(controls.count())
+                       if controls.nth(i).is_visible() and controls.nth(i).is_enabled()]
+        else:
+            buttons = [b for b in page.query_selector_all(_selector_union(SEND_BTN_SELECTORS))
+                       if b.is_visible() and b.is_enabled()]
+        if len(buttons) > 1:
+            raise RuntimeError("제출 버튼 모호")
+        if buttons:
+            if not adapter.get("click"):
+                dispatch["reason"] = "unsupported"
+                raise RuntimeError("guarded click unsupported")
+            button = buttons[0]
+            button.click(trial=True)  # actionability/scroll only, no dispatch
+            dispatch.update(state="ACTIVATION_UNKNOWN", reason="activation")
+            activated = _guarded_dispatch(page, composer_handle, expected_prompt, button, "click",
+                                          attachment, accessible_send)
+            if activated is False:
+                dispatch.update(state="NOT_DISPATCHED", reason="guard")
+                raise RuntimeError("전송 직전 composer/본문/첨부/대상 불일치")
+            if activated is not True:
+                raise RuntimeError("전송 활성화 결과 미확정")
+            dispatch["state"] = "ACTIVATED"
+            return True  # exceptions/uncertain acknowledgement propagate, no second action
         time.sleep(1)
-    print("  ⚠️  전송 버튼이 enabled 안 됨 → Enter 폴백")
-    page.keyboard.press("Enter")
-    time.sleep(1)
-    return False
+    if not adapter.get("enter"):
+        dispatch["reason"] = "unsupported"
+        raise RuntimeError("guarded Enter unsupported")
+    composer_handle.focus()
+    dispatch.update(state="ACTIVATION_UNKNOWN", reason="activation")
+    activated = _guarded_dispatch(page, composer_handle, expected_prompt, None, "enter",
+                                  attachment, accessible_send)
+    if activated is False:
+        dispatch.update(state="NOT_DISPATCHED", reason="guard")
+        raise RuntimeError("Enter 직전 composer/본문/첨부/포커스 불일치")
+    if activated is not True:
+        raise RuntimeError("전송 활성화 결과 미확정")
+    dispatch["state"] = "ACTIVATED"
+    return True
 
 
 def click_answer_now(page) -> bool:
@@ -1654,154 +2182,320 @@ def click_answer_now(page) -> bool:
     return try_answer()
 
 
-def wait_for_turn_response(page, force_after=None, max_wait=None,
-                           base_user: int = 0, base_assistant: int = 0, base_copy: int = 0,
-                           conv_url: str | None = None, base_ids: set | None = None,
-                           skip_sent_check: bool = False, on_bound=None) -> tuple[str, str, str | None]:
-    """전송이 만든 '대화 URL' + message-id에 결속해 응답을 회수(v0.6.0 identity 결속).
-    - conv_url: 이미 결속된 대화 URL(회수 재시도/harvest). None이면 전송 직후 SPA에서 포착.
-    - base_ids: 전송 직전 DOM의 data-message-id 집합 — 신규 턴을 id 차집합으로 판정.
-    - skip_sent_check: 회수 재시도/harvest 경로 — user 턴 존재를 전제(재전송 없음).
-    반환: (status, text, conv_url) — status ∈ {'ok','timeout','not_sent','sent_unknown_location','quota'}."""
-    mw = max_wait if max_wait else MAX_WAIT_SECS
-    start = time.monotonic()
-    last_status = 0
-    force_tries = 0
+def secure_create(path: Path):
+    """새 파일만 만든다(기존 경로를 따라가거나 자르지 않음). 권한 0600, 가능하면 O_NOFOLLOW(Windows는 무시)."""
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
+    fd = os.open(path, flags, 0o600)
+    return os.fdopen(fd, "wb")
 
-    # 1) 우리 user 턴이 '새로' 떴는지(count 증가 또는 대화 URL 발급). 안 떴으면 not_sent → 호출자가 재전송
-    if not skip_sent_check:
-        sent = False
-        while time.monotonic() - start < 40:  # 25→40s: 첨부 처리 지연 오판→중복 전송 방지(2026-07-19 카운슬)
-            url_flipped = bool(CONV_URL_RE.search(current_url(page)))
-            if count_msgs(page, USER_MSG_SELECTORS) > base_user or url_flipped:
-                sent = True
-                break
-            time.sleep(1)
-        if not sent:
-            return ("not_sent", "", conv_url)
 
-    # 1.5) 대화 URL 결속 — 포착 실패 시 fail-closed. 어디로 갔는지 모르는 채 기다리면
-    # 스테일 캡처(2026-07-18 실측: 옛 채팅 메시지를 새 응답으로 성공 저장)가 재발하고,
-    # 재전송하면 중복 채팅이 생기므로 전용 상태로 종료해 호출자가 둘 다 하지 않게 한다.
-    if conv_url is None:
-        conv_url = capture_conv_url(page)
-        if conv_url is None:
-            return ("sent_unknown_location", "", None)
-        print(f"  🔗 대화 결속: {conv_url}")
-        if on_bound is not None:
-            # 결속 즉시 영속화 — 응답 대기(최대 60분) 중 프로세스가 죽어도 manifest로 --harvest 가능
-            try:
-                on_bound(conv_url)
-            except Exception:
-                pass
-    _m = CONV_URL_RE.search(conv_url)
-    conv_key = _m.group(0) if _m else None
+def persist_binding(path: Path, binding: dict) -> None:
+    temp = path.with_name(path.name + "." + uuid.uuid4().hex + ".tmp")
+    with secure_create(temp) as out:
+        out.write(json.dumps(binding, ensure_ascii=False, indent=2).encode())
+        out.flush()
+        os.fsync(out.fileno())
+    os.replace(temp, path)
 
-    # 2) assistant 턴 완료까지 대기 (stop-button 사라짐 + copy 버튼 + 텍스트 안정)
-    print(f"    응답 대기 중... (최대 {mw}s"
-          + (f", {force_after}s 후 '지금 답변 받기' 재시도" if force_after else "") + ")")
-    stable_since = None
-    stall_since = None
-    reloads = 0
-    last_text = ""
-    deadline = start + mw
-    grace_used = False
-    while True:
-        if time.monotonic() >= deadline:
-            # 최대 대기 소진 — 아직 리즈닝 중이면 마지막 수단으로 '지금 답변 받기'를 눌러
-            # 답변을 플러시시키고 1회에 한해 추가 유예를 준다(실패로 버리는 것보다 회수가 낫다).
-            if not grace_used and is_streaming(page) and click_answer_now(page):
-                grace_used = True
-                deadline = time.monotonic() + FORCE_TIMEOUT_GRACE_SECS
-                print(f"    ⏰ 최대 대기 소진 — 마지막 수단 '지금 답변 받기' 클릭 → {FORCE_TIMEOUT_GRACE_SECS}s 추가 대기")
-                continue
-            break
-        elapsed = int(time.monotonic() - start)
 
-        # 결속 이탈 감지(사용자 클릭/SPA 이동 — 2026-07-18 스테일 캡처의 직접 원인) → 대화 URL로 복귀.
-        drifted = bool(conv_key) and conv_key not in current_url(page)
-        if drifted:
-            print(f"    ↩️  결속 채팅 이탈 감지({elapsed}s) → 복귀: {conv_url}")
-            try:
-                page.goto(conv_url, wait_until="domcontentloaded", timeout=30000)
-            except Exception:
-                pass
-            stable_since = None
-            time.sleep(2)
-            continue
+def _closest(node, selector):
+    return node.evaluate_handle("(n, sel) => n.closest(sel)", selector).as_element()
 
-        # force-answer: 성공할 때까지 매 틱 재시도(상한). 실패해도 latch 안 함.
-        if force_after and elapsed >= force_after and force_tries < FORCE_MAX_TRIES and is_streaming(page):
-            if click_answer_now(page):
-                print(f"    ⚡ {elapsed}s — '지금 답변 받기' 클릭(리즈닝 강제 종료)")
-                force_tries = FORCE_MAX_TRIES  # 성공 → 그만
-            else:
-                force_tries += 1
-                if force_tries >= FORCE_MAX_TRIES:
-                    print(f"    ⚠️  {elapsed}s — '지금 답변 받기' 버튼 {FORCE_MAX_TRIES}회 실패 → 자연완료 대기")
 
-        # 대상 턴(신규 assistant 노드)과 종결 신호 — 게이트별로 로그에 남겨 막힌 predicate를 바로 알 수 있게
-        node = new_assistant_node(page, base_ids, base_assistant=base_assistant)
-        cur = _node_text(node)
-        streaming = is_streaming(page)
-        terminal = turn_terminal(page, node)
+def replies_for_user(page, user):
+    if ui_adapter(page) == "current":
+        scope = _closest(user, '[data-turn-key]')
+        if scope is None:
+            raise RuntimeError("user 턴 경계 미확인")
+        users = canonical_message_nodes(scope.query_selector_all(_selector_union(USER_MSG_SELECTORS)), True)
+        if len(users) != 1 or node_ids(users[0]) != node_ids(user):
+            raise RuntimeError("공유 턴 user 모호")
+        return canonical_message_nodes(scope.query_selector_all(_selector_union(ASSISTANT_MSG_SELECTORS)), True)
+    replies = []
+    for assistant in message_nodes(page, "assistant"):
+        preceding = assistant.evaluate_handle('''a => {
+            const users = [...document.querySelectorAll('[data-message-author-role="user"]')];
+            return users.filter(u => !!(a.compareDocumentPosition(u) & Node.DOCUMENT_POSITION_PRECEDING)).pop() || null;
+        }''').as_element()
+        if preceding is not None and node_ids(preceding) == node_ids(user):
+            replies.append(assistant)
+    return replies
 
-        if elapsed - last_status >= STATUS_INTERVAL and elapsed > 0:
-            print(f"    {elapsed}s | " + ("⏳ 생성중" if streaming else "정지")
-                  + f" | assistant={count_msgs(page, ASSISTANT_MSG_SELECTORS)}/{base_assistant}"
-                  + f" fresh_len={len(cur.strip())} copy={'y' if node_copy_button(node) else 'n'}"
-                  + f" send={'y' if send_button_ready(page) else 'n'} terminal={'y' if terminal else 'n'}")
-            last_status = elapsed
 
-        if elapsed < MIN_WAIT_SECS or streaming:
-            stable_since = None
-            stall_since = None
-            time.sleep(2)
-            continue
+def tail_confirmed(page) -> bool:
+    return bool(page.evaluate('''() => {
+        const us = [...document.querySelectorAll('[data-chatgpt-search-unit-key$=":user"], [data-content-search-unit-key$=":user"], [data-message-author-role="user"]')];
+        let n = us.at(-1);
+        if (!n) return false;
+        for (let p=n.parentElement; p; p=p.parentElement) {
+            if (p.scrollHeight > p.clientHeight + 8 && /auto|scroll/.test(getComputedStyle(p).overflowY)) {
+                // 실측(2026-10-01): 현재 ChatGPT 스레드는 flex-direction:column-reverse 스크롤러라 scrollTop=0이
+                // '맨 아래'이고 위로 갈수록 음수다. 이 경우 일반 공식은 이미 맨 아래인데도 "많이 남음"으로 오판한다.
+                const cs = getComputedStyle(p);
+                if (/flex/.test(cs.display) && cs.flexDirection === 'column-reverse')
+                    return p.scrollTop >= -8;
+                return p.scrollHeight - p.clientHeight - p.scrollTop <= 8;
+            }
+        }
+        const d=document.scrollingElement;
+        return !!d && d.scrollHeight - d.clientHeight - d.scrollTop <= 8;
+    }'''))
 
-        # 스톨 복구(실측 2026-08-25): 스트리밍 표시도 없고 assistant 노드가 빈 채로 멈추는 클라이언트 스트림 유실.
-        # 서버엔 답이 있어 재로드하면 즉시 보인다(어제 '재시도 29초 성공'의 실체). 결속 URL로 재로드(재전송 아님).
-        if not cur.strip():
-            stall_since = stall_since or time.monotonic()
-            if time.monotonic() - stall_since >= STALL_RELOAD_SECS and reloads < STALL_MAX_RELOADS:
-                reloads += 1
-                print(f"    🔄 {elapsed}s — 응답 렌더 스톨(빈 턴/스트리밍 없음) → 결속 채팅 재로드 {reloads}/{STALL_MAX_RELOADS}")
-                try:
-                    page.goto(conv_url, wait_until="domcontentloaded", timeout=30000)
-                except Exception:
-                    pass
-                stall_since = None
-                stable_since = None
-                time.sleep(3)
-                continue
+
+def _binding_checkpoint(binding, updates, persist):
+    candidate = dict(binding, **updates)
+    if persist:
+        try:
+            persist(candidate)
+        except Exception as exc:
+            binding["checkpoint_error"] = True
+            raise RuntimeError("binding checkpoint 저장 실패") from exc
+    binding.update(updates)
+
+
+def bound_reply(page, binding: dict, persist=None):
+    users = message_nodes(page, "user")
+    expected_user = set(binding.get("sent_user_ids", []))
+    if not expected_user:
+        if binding.get("original_run_bound"):
+            baseline = set(binding["baseline_user_ids"])
+            candidates = [u for u in users if node_ids(u) - baseline]
         else:
-            stall_since = None
+            if not tail_confirmed(page):
+                return None
+            candidates = users[-1:]
+        if len(candidates) != 1:
+            if len(candidates) > 1:
+                raise RuntimeError("새 user 후보가 복수입니다")
+            return None
+        user = candidates[0]
+        if binding.get("original_run_bound"):
+            shown = user_body_text(user)
+            exact_ok = hashlib.sha256(normalize(shown).encode()).hexdigest() == binding.get("sent_text_sha256")
+            if not (exact_ok or fingerprint_matches(shown, binding.get("sent_text_fingerprint"))):
+                raise RuntimeError("전송 user 본문 불일치")
+        scope = _closest(user, '[data-turn-key]') if ui_adapter(page) == "current" else None
+        _binding_checkpoint(binding, dict(sent_user_ids=sorted(node_ids(user)), assistant_ids=[],
+            turn_key=scope.get_attribute("data-turn-key") if scope else None, phase="USER_BOUND"), persist)
+    else:
+        candidates = [u for u in users if node_ids(u) == expected_user]
+        if len(candidates) != 1:
+            return None
+        user = candidates[0]
+        if not binding.get("original_run_bound") and (not users or node_ids(users[-1]) != expected_user):
+            raise RuntimeError("수동 회수 선택 후 user 변경 — 다시 선택하세요")
+    replies = replies_for_user(page, user)
+    if len(replies) > 1:
+        raise RuntimeError("해당 user의 assistant가 유일하지 않음")
+    if not replies:
+        return None
+    node = replies[0]
+    ids = node_ids(node)
+    if not ids:
+        raise RuntimeError("assistant identity 없음")
+    expected = set(binding.get("assistant_ids", []))
+    if expected and ids != expected:
+        raise RuntimeError("회수 대상 assistant 변경 — 자동 재결속 금지")
+    if not expected:
+        if binding.get("original_run_bound") and not ids - set(binding["baseline_assistant_ids"]):
+            raise RuntimeError("기존 assistant를 새 응답으로 사용할 수 없음")
+        _binding_checkpoint(binding, dict(assistant_ids=sorted(ids), phase="ASSISTANT_BOUND",
+            unit_key=node.get_attribute("data-chatgpt-search-unit-key") or node.get_attribute("data-content-search-unit-key")), persist)
+    return node
 
-        if not terminal or not cur.strip():
-            quota_msg = detect_quota_block(page)
-            if quota_msg:
-                print(f"    ⛔ 사용량 한도 감지 → 대기 중단: {quota_msg[:80]}")
-                return ("quota", "", conv_url)
-            stable_since = None
-            time.sleep(2)
-            continue
-        if normalize(cur) != normalize(last_text):
-            last_text = cur
-            stable_since = time.monotonic()
-            time.sleep(2)
-            continue
-        if stable_since and (time.monotonic() - stable_since) >= STABLE_CHECK_SECS:
-            # 회수: 대상 노드의 copy 우선(마크다운 보존), 대조 실패/버튼 없음은 그 노드의 DOM 텍스트로 폴백
-            txt = copy_assistant_node(node, expected=cur)
-            if txt and txt.strip():
-                print(f"    ✅ 응답 수신: {len(txt)}자 ({int(time.monotonic()-start)}s, copy)")
-                return ("ok", txt, conv_url)
-            print(f"    ✅ 응답 수신: {len(cur)}자 ({int(time.monotonic()-start)}s, DOM)")
-            return ("ok", cur, conv_url)
-        time.sleep(2)
 
-    fallback = _node_text(new_assistant_node(page, base_ids, base_assistant=base_assistant))
-    return ("timeout", fallback, conv_url) if fallback else ("timeout", "", conv_url)
+def conversation_key(url: str | None) -> str | None:
+    """대화 정체성은 chatgpt.com의 `/c/<대화ID>`다. 실측(2026-10-01): SPA가 프로젝트 슬러그를 잠깐 떼었다 붙여
+    (`/g/g-p-<ID>-<slug>/c/<id>` ↔ `/g/g-p-<ID>/c/<id>`) 문자열 전체 비교는 같은 대화를 '이탈'로 오판한다."""
+    try:
+        parsed = urllib.parse.urlsplit(url or "")
+    except ValueError:
+        return None
+    if parsed.scheme != "https" or parsed.hostname != "chatgpt.com":
+        return None
+    match = CONV_URL_RE.search(parsed.path)
+    return match.group(0).lower() if match else None
+
+
+def response_snapshot(page, binding: dict, persist=None):
+    bound = conversation_key(binding["chat_url"])
+    if bound is not None:
+        same = conversation_key(current_url(page)) == bound
+    else:  # 운영 결속 URL은 항상 /c/<ID>를 갖는다. 그렇지 않은 URL(로컬 fixture 등)은 기존 문자열 비교를 유지한다.
+        same = (current_url(page).split("?")[0].rstrip("/") == binding["chat_url"].split("?")[0].rstrip("/"))
+    if not same:
+        raise RuntimeError("결속 대화 이탈")
+    node = bound_reply(page, binding, persist)
+    state = streaming_state(page)
+    if node is None or state != "absent":
+        return None
+    if error_surface_state(page) != "clear":
+        return None
+    if find_input(page) is None or not turn_terminal(page, node):
+        return None
+    text = node.inner_text()  # errors must invalidate, never become empty success
+    text = _ASSISTANT_LABEL_RE.sub("", text, count=1)  # 스크린리더용 "ChatGPT 답변:" 접두어는 응답 본문이 아니다
+    if not text.strip():
+        return None
+    return (tuple(sorted(node_ids(node))), text)
+
+
+def validate_manifest_file(path):
+    if path.name == ".env" or path.name.startswith(".env.") or path.resolve().name.startswith(".env"):
+        raise ValueError("환경 파일 거부")
+    loaded = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(loaded, dict):
+        raise ValueError("manifest object required")
+    parsed = urllib.parse.urlsplit(loaded.get("chat_url") or "")
+    if (parsed.scheme != "https" or parsed.hostname != "chatgpt.com" or parsed.username or parsed.port
+            or not CONV_URL_RE.search(parsed.path)):
+        raise ValueError("manifest URL")
+    if loaded.get("schema_version") == 2:
+        if not isinstance(loaded.get("original_run_bound"), bool):
+            raise ValueError("binding type")
+        for key in ("sent_user_ids", "assistant_ids"):
+            if not isinstance(loaded.get(key), list) or not all(isinstance(i, str) and i for i in loaded[key]):
+                raise ValueError("binding ids")
+        if not loaded["sent_user_ids"]:
+            raise ValueError("전송 user 미결속 — 수동 URL 회수 필요")
+        if loaded["original_run_bound"]:
+            for key in ("baseline_user_ids", "baseline_assistant_ids"):
+                if not isinstance(loaded.get(key), list) or not all(isinstance(i, str) for i in loaded[key]):
+                    raise ValueError("전송 기준 identity 없음")
+    elif "schema_version" in loaded or not isinstance(loaded.get("run_tag"), str):
+        raise ValueError("unknown manifest schema")
+    return loaded
+
+
+def recovery_hint(binding, manifest_path) -> str:
+    try:
+        disk = validate_manifest_file(manifest_path)
+        same_run = all(disk.get(k) == binding.get(k) for k in ("run_id", "chat_url", "original_run_bound"))
+        same_user = not binding.get("sent_user_ids") or disk["sent_user_ids"] == binding["sent_user_ids"]
+        if not binding.get("checkpoint_error") and disk.get("schema_version") == 2 and same_run and same_user:
+            return f"\n   저장된 결속으로 회수: pack_and_ask.py --harvest '{manifest_path}'"
+    except Exception:
+        pass
+    if binding.get("chat_url"):
+        return ("\n   유효한 저장 결속 미확인 — 원 실행 복구가 아닌 수동 latest-user 회수 대안:"
+                f"\n   pack_and_ask.py --harvest '{binding['chat_url']}'")
+    return "\n   대화 위치 미확인 — 프로젝트에서 전송 여부를 먼저 확인하세요."
+
+
+def bound_user_is_latest(page, binding: dict) -> bool:
+    """강제답변 버튼은 페이지의 첫 '답변 받기' 행을 누르므로 대상 턴을 지정하지 못한다(독립 리뷰 F6). 결속된 user가
+    대화의 마지막 user일 때만(= 생성 중인 턴이 결속된 턴일 때만) 허용하고, 확인하지 못하면 누르지 않는다."""
+    try:
+        users = message_nodes(page, "user")
+        return bool(users) and node_ids(users[-1]) == set(binding.get("sent_user_ids", []))
+    except Exception:
+        return False
+
+
+def wait_for_turn_response(page, force_after=None, max_wait=None,
+                           base_user=0, base_assistant=0, base_copy=0, conv_url=None,
+                           base_ids=None, skip_sent_check=False, on_bound=None,
+                           binding=None, persist=None, save_response=None):
+    if binding is None:
+        raise RuntimeError("회수 binding 필수")
+    start = time.monotonic()
+    deadline = start + (max_wait or MAX_WAIT_SECS)
+    url_deadline = min(deadline, start + CONV_URL_CAPTURE_SECS)
+    error_since = None
+    stable_since = None
+    last = None
+    previous_binding = None
+    last_status = -STATUS_INTERVAL
+    forced = False
+    while time.monotonic() < deadline:
+        now = time.monotonic()
+        elapsed = now - start
+        if detect_quota_block(page):
+            binding["last_wait_status"] = "quota"
+            if persist:
+                persist(binding)
+            return "quota", "", binding.get("chat_url")
+        surface = error_surface_state(page)
+        if surface == "error":
+            if error_since is None:
+                error_since = now
+            if now - error_since >= VISIBLE_ERROR_GRACE_SECS:
+                binding["last_wait_status"] = "visible_error"
+                if persist:
+                    persist(binding)
+                print("    가시적 오류/로그인 표면 지속 — 회수 중단, 같은 대화 확인 필요", flush=True)
+                return "error", "", binding.get("chat_url")
+        else:
+            error_since = None  # unknown is not proof of a persistent error
+        if surface != "clear":
+            stable_since, last = None, None
+        if not binding.get("chat_url"):
+            url = current_url(page)
+            if CONV_URL_RE.search(url):
+                binding["chat_url"] = url
+                if on_bound:
+                    on_bound(url)
+            else:
+                if elapsed - last_status >= STATUS_INTERVAL:
+                    print(f"    {int(elapsed)}s | phase=WAIT_CONVERSATION_URL | error_surface={surface}"
+                          f" | limit={int(url_deadline - start)}s", flush=True)
+                    last_status = elapsed
+                if now >= url_deadline:
+                    binding["last_wait_status"] = "sent_unknown_location"
+                    if persist:
+                        persist(binding)
+                    return "sent_unknown_location", "", None
+                time.sleep(0.5)
+                continue
+        try:
+            snapshot = response_snapshot(page, binding, persist=persist) if surface == "clear" else None
+        except RuntimeError:
+            raise  # identity changes must not silently choose another response
+        except Exception:
+            snapshot = None
+        serialized = json.dumps(binding, sort_keys=True)
+        if serialized != previous_binding:
+            if persist:
+                persist(binding)
+            previous_binding = serialized
+        now = time.monotonic()
+        elapsed = now - start
+        observed_stream = streaming_state(page)
+        if observed_stream != "absent":
+            snapshot = None
+            stable_since, last = None, None
+        if (force_after and elapsed >= force_after and not forced and binding.get("sent_user_ids")
+                and surface == "clear" and observed_stream == "streaming"
+                and bound_user_is_latest(page, binding)):
+            forced = click_answer_now(page)
+            if forced:
+                binding["forced_answer"] = True
+                if persist:
+                    persist(binding)
+                stable_since, last = None, None
+        interval = STATUS_INTERVAL if elapsed < 60 else 60
+        if elapsed - last_status >= interval:
+            print(f"    {int(elapsed)}s | phase={binding.get('phase')} | streaming={observed_stream}"
+                  f" | terminal={'y' if snapshot else 'n'} | error_surface={surface}", flush=True)
+            last_status = elapsed
+        if snapshot is None or elapsed < MIN_WAIT_SECS:
+            stable_since, last = None, None
+        elif snapshot != last or stable_since is None:
+            stable_since, last = now, snapshot
+        elif now - stable_since >= STABLE_CHECK_SECS:
+            if response_snapshot(page, binding, persist=persist) != snapshot:
+                stable_since, last = None, None
+                continue
+            if save_response and not save_response(page, binding, snapshot):
+                stable_since, last = None, None
+                continue
+            return "ok", snapshot[1], binding["chat_url"]
+        time.sleep(0.5)
+    status = "timeout" if binding.get("chat_url") else "sent_unknown_location"
+    binding["last_wait_status"] = status
+    if persist:
+        persist(binding)
+    return status, "", binding.get("chat_url")
 
 
 # ===========================================================================
@@ -1950,12 +2644,34 @@ def visible_alert_dialog_text(page) -> str:
     return "\n".join(parts)
 
 
+_PROJECT_PATH_RE = re.compile(r"^/g/g-p-[0-9a-f]{32}(?:-[^/?#]*)?(?:/project)?/?$", re.I)
+
+
+def chatgpt_origin_ok(url: str | None) -> bool:
+    """https://chatgpt.com(자격정보·포트 없음)만 인정. URL 문자열에 프로젝트 id가 들어 있다는 사실만으로는 부족하다."""
+    try:
+        parsed = urllib.parse.urlsplit(url or "")
+        return (parsed.scheme == "https" and parsed.hostname == "chatgpt.com"
+                and not parsed.username and not parsed.password and parsed.port is None)
+    except ValueError:
+        return False
+
+
+def project_url_ok(url: str | None) -> bool:
+    """프로젝트 홈 URL 형태: chatgpt.com의 /g/g-p-<32hex>[-slug][/project]. 캐시·탐색 결과 모두 이동 전에 검증한다."""
+    if not chatgpt_origin_ok(url):
+        return False
+    return bool(_PROJECT_PATH_RE.match(urllib.parse.urlsplit(url).path))
+
+
 def project_home_state(page, url: str, probe_secs: int = 15) -> str:
     """프로젝트 URL 생존을 4상태로 판정(2초 단발 → 폴링 + 연속 안정 구간).
     ok: 그 g-p id가 URL에 유지 + 가시 컴포저 + 차단 다이얼로그 없음이 4초 연속.
     dead: id 불일치(홈 리다이렉트)·명시적 403/404·접근불가 문구 — 현 워크스페이스에서 재탐색/재생성 대상.
     auth: 로그인 벽. unknown: 지연·네트워크·UI 변경 — 캐시 삭제·프로젝트 생성 모두 금지(fail-closed).
     False 하나로 뭉개면 일시 오류에 정상 캐시를 지우고 중복 프로젝트를 만든다(2026-08-24 GPT Pro 리뷰)."""
+    if not project_url_ok(url):
+        return PROJECT_DEAD  # 외부 origin/비정상 경로의 캐시·후보는 이동하지 않고 죽은 값으로 취급(재탐색 대상)
     m = _PROJECT_ID_RE.search(url)
     if not m:
         return PROJECT_UNKNOWN  # 파싱 실패는 identity 검사 생략 사유가 아니다
@@ -1983,7 +2699,8 @@ def project_home_state(page, url: str, probe_secs: int = 15) -> str:
             blocking = visible_alert_dialog_text(page)
             if re.search(_PROJECT_ACCESS_ERROR_RE, blocking, re.I):
                 return PROJECT_DEAD
-            if gp_id in final_url.lower() and not blocking and find_visible_input(page) is not None:
+            if (chatgpt_origin_ok(final_url) and gp_id in final_url.lower() and not blocking
+                    and find_visible_input(page) is not None):
                 if healthy_since is None:
                     healthy_since = time.monotonic()
                 elif time.monotonic() - healthy_since >= 4:
@@ -1993,7 +2710,7 @@ def project_home_state(page, url: str, probe_secs: int = 15) -> str:
         except Exception:
             healthy_since = None
         time.sleep(0.5)
-    if final_url and gp_id not in final_url.lower():
+    if final_url and (not chatgpt_origin_ok(final_url) or gp_id not in final_url.lower()):
         return PROJECT_DEAD
     return PROJECT_UNKNOWN
 
@@ -2192,21 +2909,31 @@ def _ensure_project_locked(page, name: str, cache_key: str, cache_path: Path) ->
             if cached_state == PROJECT_UNKNOWN:
                 return None
 
-    candidate = find_project_url_api(page, name)  # API 1순위(현 오리진 페이지에서 즉시)
-    if candidate and project_home_state(page, candidate) != PROJECT_OK:
-        candidate = None
+    # 탐색으로 찾은 후보도 4상태를 유지한다(독립 리뷰 F4/N5): 존재가 확인된 프로젝트의 unknown/auth를 '없음'으로
+    # 바꾸면 같은 이름의 새 프로젝트를 만들고 캐시를 갈아끼워 이후 리뷰가 기존 프로젝트와 분리된다.
+    # 명시적으로 dead(없음 확정)이거나 후보 자체가 없을 때만 다음 단계/생성으로 진행한다.
+    def vet(found):
+        if not found:
+            return None, None
+        state = project_home_state(page, found)
+        return (found if state == PROJECT_OK else None), state
+
+    candidate, state = vet(find_project_url_api(page, name))  # API 1순위(현 오리진 페이지에서 즉시)
+    if state in (PROJECT_UNKNOWN, PROJECT_AUTH):
+        print(f"  ℹ️  탐색한 프로젝트 판정={state} → 새 프로젝트를 만들지 않고 이번 런은 폴백")
+        return None
     if not candidate:
         if not _open_chat_home(page):
             return None
-        candidate = find_project_url(page, name)  # DOM 폴백(구 UI/API 실패 대비)
-        if candidate and project_home_state(page, candidate) != PROJECT_OK:
-            candidate = None
+        candidate, state = vet(find_project_url(page, name))  # DOM 폴백(구 UI/API 실패 대비)
+        if state in (PROJECT_UNKNOWN, PROJECT_AUTH):
+            print(f"  ℹ️  탐색한 프로젝트 판정={state} → 새 프로젝트를 만들지 않고 이번 런은 폴백")
+            return None
     if not candidate:
         if not _open_chat_home(page):
             return None
-        candidate = create_project(page, name)
-        if candidate and project_home_state(page, candidate) != PROJECT_OK:
-            candidate = None
+        created = create_project(page, name)
+        candidate = created if created and project_home_state(page, created) == PROJECT_OK else None
 
     latest = _load_project_cache(cache_path)  # lock 안이지만 재읽기 — 항상 최신 dict에 갱신
     if candidate:
@@ -2222,7 +2949,7 @@ def _ensure_project_locked(page, name: str, cache_key: str, cache_path: Path) ->
 # ===========================================================================
 # main
 # ===========================================================================
-def main():
+def _main():
     ap = argparse.ArgumentParser(description="repomix → 구독 ChatGPT(GPT Pro, 최신 플래그십) 분석")
     ap.add_argument("--target", default=None, help="분석 대상 폴더(생략 시 프롬프트만 = 의견 모드)")
     ap.add_argument("--include", default=None, help='repomix --include 글롭')
@@ -2328,16 +3055,27 @@ def main():
 
     # --harvest: 전송 없이 기존 대화에서 회수만 — 패킹/프롬프트/프로젝트 진입 불필요
     harvest_url = None
+    recovery_binding = None
     if args.harvest:
         _h = Path(args.harvest).expanduser()
+        if _h.name == ".env" or _h.name.startswith(".env."):
+            sys.exit("❌ 환경 파일은 manifest로 읽지 않습니다")
         if _h.exists():
             try:
-                harvest_url = json.loads(_h.read_text(encoding="utf-8")).get("chat_url")
+                loaded = validate_manifest_file(_h)
+                harvest_url = loaded.get("chat_url")
+                if loaded.get("schema_version") == 2:
+                    recovery_binding = loaded
+                else:
+                    print("  legacy manifest → 수동 latest-user 회수; 원 실행 identity 미확인", flush=True)
+                    recovery_binding = {"source_manifest": str(_h), "original_run_bound": False}
             except Exception:
                 sys.exit(f"❌ manifest 파싱 실패: {_h}")
         else:
             harvest_url = args.harvest
-        if not harvest_url or not CONV_URL_RE.search(harvest_url):
+        parsed = urllib.parse.urlsplit(harvest_url or "")
+        if (parsed.scheme != "https" or parsed.hostname != "chatgpt.com" or parsed.username or parsed.port
+                or not CONV_URL_RE.search(parsed.path)):
             sys.exit(f"❌ --harvest 인자가 대화 URL(/c/<id>)이 아님: {args.harvest}")
         args.target = None  # 회수 모드는 전송이 없다 — 패킹 생략
 
@@ -2424,8 +3162,55 @@ def main():
     conv_url = harvest_url          # 결속된 대화 URL — 있으면 이후 시도는 '회수 재시도'(재전송 금지)
     base_ids_snapshot: set | None = (set() if harvest_url else None)
     sent_unknown = False
+    dispatch = {"state": "NOT_DISPATCHED", "reason": "preparation"}
     quota_hit = False
+    surface_error = False
     manifest_path = out_dir / f"manifest_{label}_{run_tag}.json"
+    resp_path = out_dir / f"response_{label}_{run_tag}.md"
+    binding = recovery_binding or {}
+    # 전용 Chrome 프로세스 소유권 검증(lsof/ps 기반)은 이 플러그인에 포함하지 않는다(Codex 포트 전용).
+    binding["ownership_verification"] = "not_checked"
+    if harvest_url:
+        if not binding.get("original_run_bound"):
+            print("  수동 회수: 마지막 user의 답변 선택; 원 실행 결속 미확인", flush=True)
+        binding.setdefault("original_run_bound", False)
+        binding.setdefault("harvest_mode", "run" if binding["original_run_bound"] else "manual_latest_user")
+        binding.setdefault("binding_origin", "sent_request" if binding["original_run_bound"] else "manual_selection")
+        binding.setdefault("phase", "MANUAL_SELECT")
+        binding["chat_url"] = harvest_url
+    else:
+        binding.update(original_run_bound=True, phase="PREPARED", harvest_mode="run",
+                       binding_origin="sent_request", sent_user_ids=[], assistant_ids=[])
+    binding.setdefault("schema_version", 2)
+    binding.setdefault("run_id", run_tag)
+    binding.setdefault("sent_user_ids", [])
+    binding.setdefault("assistant_ids", [])
+
+    def save_binding(value):
+        try:
+            persist_binding(manifest_path, value)
+        except Exception:
+            binding["checkpoint_error"] = True
+            raise
+
+    def publish_response(page, value, snapshot):
+        metadata = {k: value.get(k) for k in ("run_id", "harvest_mode", "original_run_bound", "chat_url",
+                    "sent_user_ids", "assistant_ids", "model_verification", "ownership_verification", "forced_answer")}
+        body = "# ChatGPT 응답\n\n```json\n" + json.dumps(metadata, ensure_ascii=False, indent=2) + "\n```\n\n" + snapshot[1] + "\n"
+        temp = resp_path.with_name(resp_path.name + "." + uuid.uuid4().hex + ".tmp")
+        with secure_create(temp) as f:
+            f.write(body.encode())
+            f.flush()
+            os.fsync(f.fileno())
+        if response_snapshot(page, value, persist=save_binding) != snapshot:
+            return False
+        os.replace(temp, resp_path)
+        value.update(phase="COMPLETE", response_sha256=hashlib.sha256(snapshot[1].encode()).hexdigest(),
+                     response_path=str(resp_path))
+        save_binding(value)
+        return True
+
+    last_failure = None
     # Pro는 20~60분이 정상 범위 — 명시값(--max-wait/env) 없을 때만 기본 상향
     mw_eff = args.max_wait
     if (mw_eff is None and "INSANE_REVIEW_MAX_WAIT" not in os.environ
@@ -2459,9 +3244,14 @@ def main():
                             raise RuntimeError("ChatGPT 로그인 벽 감지 — 해당 브라우저에서 chatgpt.com 로그인 확인")
                         status, text, conv_url = wait_for_turn_response(
                             page, force_after=args.force_answer_after, max_wait=mw_eff,
-                            conv_url=conv_url, base_ids=base_ids_snapshot, skip_sent_check=True)
+                            conv_url=conv_url, base_ids=base_ids_snapshot, skip_sent_check=True,
+                            binding=binding, persist=save_binding, save_response=publish_response)
                         if status == "quota":
                             print("  ⛔ 사용량 한도 감지 — 회수 재시도 중단(한도 해제 후 --harvest 재실행)")
+                            quota_hit = True
+                            break
+                        if status == "error":
+                            surface_error = True
                             break
                         if status == "timeout":
                             print(f"  ⚠️  타임아웃 — 다음 시도도 같은 채팅 회수 재시도: {conv_url}")
@@ -2499,46 +3289,42 @@ def main():
                             if entered:
                                 print(f"  🗂  프로젝트 '{project_name}'에 채팅 정리 → {proj_url}")
                             else:
-                                # 폴백: 프로젝트 미확보/진입 실패 모두 일반 채팅으로(컴포저 보장)
-                                print(f"  ⚠️  프로젝트 '{project_name}' 사용 불가 → 일반 채팅으로 진행(폴백)")
-                                try:
-                                    page.goto(CHATGPT_URL, wait_until="load", timeout=60000)
-                                    time.sleep(2)
-                                    for _ in range(10):
-                                        if find_input(page):
-                                            break
-                                        time.sleep(1)
-                                except Exception:
-                                    pass
+                                raise RuntimeError("요청 프로젝트 확인 실패 — 전송 중단")
 
                         # Chat/Work 게이트 — 모델 스위처를 열기 '전에' 보정한다.
                         # Work 모드엔 Pro 눈금 자체가 없어 슬라이더 인덱스 계산이 무의미해진다.
-                        chat_ok, seen_mode = ensure_chat_mode(page)
-                        if not chat_ok and (args.model or "").lower() == "pro":
-                            raise RuntimeError(
-                                f"Chat 모드 전환 실패(현재='{seen_mode or '미상'}') — Work 모드엔 Pro가 없다 → 전송 중단(fail-closed)")
+                        chat_ok, _mode_state = ensure_chat_mode(page)
+                        if not chat_ok:
+                            raise RuntimeError("모드 상태 미확인")
 
-                        print(f"  현재 pill: {read_model_pills(page)}")
                         if args.model:
-                            print(f"  모델/추론단계 선택: '{args.model}'"
-                                   + (f" (모델명 검증='{args.require_model}')" if args.require_model else ""))
+                            print("  요청된 모델/추론단계 사전검증 시작")
                             verified, v_name = select_model(page, args.model, require_model=args.require_model)
                             if not verified:
-                                raise RuntimeError(f"모델/추론단계 검증 실패 (model={args.model}, require={args.require_model}) — 전송 중단")
+                                raise RuntimeError("모델/추론단계 사전검증 실패")
                             verified_model_name = v_name
 
                         # 본문은 '첨부'가 기본. 첨부 실패 시:
                         #  - --attach면 fail-closed(중단)
                         #  - 아니면 pack이 상한 내일 때만 프롬프트에 인라인 붙여 폴백, 초과면 fail-closed(잘린 전송 방지)
                         send_prompt = prompt
+                        attachment = None
                         if pack_path is not None:
-                            if attach_file(page, pack_path):
+                            attachment = attach_file(page, pack_path)
+                            if attachment["state"] == "confirmed":
                                 if not args.no_project:
                                     # 같은 프로젝트의 옛 채팅/파일을 근거로 쓰는 오염 방지(2026-07-19 카운슬 P2)
                                     send_prompt = prompt + PROJECT_SCOPE_GUARD
                             else:
-                                if args.attach:
-                                    raise RuntimeError("코드 첨부 확인 실패 + --attach(첨부 강제) → 중단(fail-closed)")
+                                state = attachment.get("state")
+                                reason = attachment.get("reason")
+                                if state not in {"not_attempted", "attempted_unconfirmed"}:
+                                    state = "unknown"
+                                if reason not in _SAFE_ATTACHMENT_REASONS:
+                                    reason = "unclassified"
+                                print(f"  ❌ 첨부 준비 중단 (state={state}, reason={reason})", flush=True)
+                                if args.attach or attachment["state"] != "not_attempted" or not attachment["fallback_allowed"]:
+                                    raise RuntimeError("첨부 미확인/unsupported — 전송 및 인라인 fallback 금지")
                                 send_prompt = build_paste_fallback(prompt, pack_path)
                                 if send_prompt is None:
                                     raise RuntimeError("코드 첨부 실패 + pack이 커서 붙여넣기 폴백 불가 → 중단(fail-closed)")
@@ -2550,34 +3336,56 @@ def main():
                         base_copy = count_msgs_strict(page, COPY_BTN_SELECTORS)
                         base_ids_snapshot = msg_id_set(page)
 
-                        put_text(page, send_prompt)
+                        composer = active_composer(page)
+                        put_text(page, send_prompt, composer)
                         # 보낼 텍스트 '전체'가 입력창에 들어갔는지 검증 — 아니면 composer 비우고 1회 재입력, 그래도 불일치면 중단
                         # (첨부만/잘린 질문이 전송되어 '오염된 응답'을 성공저장하는 fail-open 차단)
-                        if not composer_has_prompt(page, send_prompt):
-                            clear_composer(page)
-                            put_text(page, send_prompt)
-                            if not composer_has_prompt(page, send_prompt):
+                        if not composer_has_prompt(page, send_prompt, composer):
+                            clear_composer(page, composer)
+                            put_text(page, send_prompt, composer)
+                            if not composer_has_prompt(page, send_prompt, composer):
                                 raise RuntimeError("프롬프트가 입력창에 온전히 안 들어감 → 중단(첨부만/잘린 전송 방지, fail-closed)")
-                        click_send(page)
+                        if args.model:
+                            final_verified, final_model = select_model(page, args.model, require_model=args.require_model)
+                            if not final_verified or final_model != verified_model_name:
+                                raise RuntimeError("전송 직전 모델 변경/미확인")
+                        binding.update(
+                            baseline_user_ids=sorted(set().union(*(node_ids(n) for n in message_nodes(page, "user")))),
+                            baseline_assistant_ids=sorted(set().union(*(node_ids(n) for n in message_nodes(page, "assistant")))),
+                            model_verification=verified_model_name, project=project_name,
+                            sent_text_sha256=hashlib.sha256(normalize(send_prompt).encode()).hexdigest(),
+                            sent_text_fingerprint=message_fingerprint(send_prompt),
+                            prompt_sha256=hashlib.sha256(prompt.encode()).hexdigest(),
+                            pack_sha256=hashlib.sha256(pack_path.read_bytes()).hexdigest() if pack_path else None,
+                            phase="SEND_PENDING")
+                        dispatch["reason"] = "checkpoint"
+                        save_binding(binding)
+                        # An uninstrumented/failed call is conservative; click_send
+                        # supplies authoritative pre-activation rejection evidence.
+                        dispatch.update(state="ACTIVATION_UNKNOWN", reason="activation")
+                        attachment_guard = attachment if attachment and attachment.get("state") == "confirmed" else None
+                        click_send(page, send_prompt, composer, dispatch, attachment_guard)
                         manifest_written = False
 
                         def _persist_binding(url, _sp=send_prompt):
                             nonlocal manifest_written
                             if not manifest_written:
-                                write_run_manifest(manifest_path, url, label, run_tag, _sp, pack_path)
+                                binding["chat_url"] = url
+                                save_binding(binding)
                                 manifest_written = True
 
                         status, text, conv_url = wait_for_turn_response(
                             page, force_after=args.force_answer_after, max_wait=mw_eff,
                             base_user=base_user, base_assistant=base_assistant,
-                            base_copy=base_copy, base_ids=base_ids_snapshot, on_bound=_persist_binding)
+                            base_copy=base_copy, base_ids=base_ids_snapshot, on_bound=_persist_binding,
+                            binding=binding, persist=save_binding, save_response=publish_response)
                         if conv_url:
                             _persist_binding(conv_url)  # 결속 콜백이 못 돈 경로(전달된 URL) 보강 — 멱등
-                        if status == "not_sent":
-                            print("  ⚠️  user 턴 미생성(전송 안 됨) → 재시도(재전송)")
-                            continue
+                        if status == "error":
+                            surface_error = True
+                            break
                         if status == "sent_unknown_location":
-                            print("  ⚠️  전송은 확인됐지만 대화 URL 포착 실패 — 중복 전송 방지를 위해 재전송하지 않고 종료")
+                            print("  ⚠️  전송 시도 후 대화 URL 미확인 — 중복 방지를 위해 재전송하지 않고 종료")
                             sent_unknown = True
                             break
                         if status == "quota":
@@ -2601,20 +3409,28 @@ def main():
                 break
             print(f"  ⚠️  시도 {attempt}: 응답 비어있음")
         except Exception as exc:
-            print(f"  ⚠️  시도 {attempt} 실패: {str(exc)[:160]}")
+            last_failure = ("응답 회수/검증 실패" if conv_url or binding.get("chat_url") else
+                            DISPATCH_REASONS.get(dispatch["reason"], "전송 준비/검증 실패"))
+            print(f"  ❌ 실행 단계 실패: {last_failure}", file=sys.stderr, flush=True)
+            print(f"     ↳ 사유: {failure_detail(exc)}", file=sys.stderr, flush=True)
+            if dispatch["state"] != "NOT_DISPATCHED" and not binding.get("chat_url"):
+                sent_unknown = True
+            break
 
+    if surface_error:
+        sys.exit("❌ 가시적 오류/로그인 표면이 지속되어 회수를 중단했습니다. 자동 재시도·재전송 없음."
+                 + recovery_hint(binding, manifest_path))
     if quota_hit:
-        hint = (f"\n   결속 채팅: {conv_url}\n   한도 해제 후 회수 시도: pack_and_ask.py --harvest '{conv_url}'"
-                if conv_url else "")
-        sys.exit("❌ ChatGPT 사용량 한도 도달 — 대기·재시도 중단(응답 미생성)." + hint)
+        sys.exit("❌ ChatGPT 사용량 한도 도달 — 대기·재시도 중단. 한도 해제 후 회수하세요."
+                 + recovery_hint(binding, manifest_path))
     if sent_unknown:
-        sys.exit("❌ 전송은 됐지만 대화 URL 미포착(sent-unknown-location) — 중복 방지 위해 재전송 안 함.\n"
-                 "   ChatGPT 프로젝트에서 방금 생긴 채팅을 찾아 다음으로 회수하세요:\n"
+        sys.exit("❌ 전송 시도 결과/대화 위치 미확인 — 중복 방지 위해 재전송 안 함.\n"
+                 "   자동 재전송하지 않습니다. 제출 여부를 먼저 확인하고, 일치하는 대화가 있을 때만 회수하세요:\n"
                  "   pack_and_ask.py --harvest '<채팅URL>'")
     if not response:
-        hint = (f"\n   결속 채팅: {conv_url}\n   나중에 회수: pack_and_ask.py --harvest '{conv_url}'"
-                if conv_url else "")
-        sys.exit("❌ 응답 회수 실패 (모든 재시도 소진)" + hint)
+        if not harvest_url and dispatch["state"] == "NOT_DISPATCHED":
+            sys.exit(f"❌ 전송 전 실패 — 이 실행은 전송되지 않았습니다 ({last_failure or '검증 미완'})")
+        sys.exit("❌ 응답 회수 실패" + recovery_hint(binding, manifest_path))
 
     # 회수 품질 경고(하드 차단 아님 — 카운슬 합의로 경고 강등): 파일-저장형/단답 응답 의심 패턴
     if len(response) < 500 and re.search(r"저장했습니다|다운로드|sandbox:/", response):
@@ -2623,20 +3439,16 @@ def main():
     # 패킹 파일 시크릿 위생: --delete-pack이면 삭제
     if pack_path is not None and args.delete_pack:
         try:
-            pack_path.unlink()
-            print(f"  🔒 패킹 파일 삭제됨(--delete-pack)")
-        except OSError:
+            if Path("/usr/bin/trash").is_file():
+                subprocess.run(["/usr/bin/trash", str(pack_path)], check=True, capture_output=True)
+                print("  🔒 패킹 파일을 휴지통으로 이동")
+            else:
+                print("  ⚠️ trash 미지원 — 패킹 파일 보존")
+        except (OSError, subprocess.SubprocessError):
             pass
 
     resp_path = out_dir / f"response_{label}_{run_tag}.md"
-    pack_line = (f"- 패킹: `{pack_path.name}`" + (f" (~{tokens:,} tokens)\n" if tokens else "\n")
-                 if pack_path is not None else "- 패킹: (없음 / 프롬프트-only)\n")
-    model_line = f"- 모델: `{verified_model_name}`\n" if verified_model_name else ""
-    body = (f"# {label} — GPT 응답 (구독 ChatGPT)\n\n" + pack_line + model_line
-            + f"- 프롬프트: {prompt[:80]}...\n\n---\n\n{response}\n")
-    tmp = resp_path.with_suffix(".md.tmp")
-    tmp.write_text(body, encoding="utf-8")
-    os.replace(tmp, resp_path)  # 원자적 저장
+    # publish_response already revalidated the bound live page and atomically saved it.
     print(f"\n[완료] 응답 저장: {resp_path}")
     if args.council:
         real_stdout.write(response + "\n")
@@ -2644,6 +3456,10 @@ def main():
     else:
         print("─" * 50)
         print(response[:800] + ("\n...(생략)" if len(response) > 800 else ""))
+
+
+def main():
+    return _main()
 
 
 if __name__ == "__main__":
